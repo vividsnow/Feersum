@@ -46,7 +46,7 @@ For read handles:
     # assuming the handle is "open":
     $r->seek(2,SEEK_CUR); # returns 1, discards skipped bytes
     $r->seek(-1,SEEK_CUR); # returns 0, can't seek back
-    
+
     # not yet supported, throws exception:
     # $r->poll_cb(sub { .... });
 
