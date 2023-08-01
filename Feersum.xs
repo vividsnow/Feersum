@@ -533,27 +533,22 @@ static int
 prep_socket (int fd, int is_tcp)
 {
     int flags;
-
     // make it non-blocking
     flags = O_NONBLOCK;
-    if (unlikely(fcntl(fd, F_SETFL, flags) < 0))
-        return -1;
+    if (unlikely(fcntl(fd, F_SETFL, flags) < 0)) return -1;
     if (likely(is_tcp)) {
         // flush writes immediately
         flags = 1;
-        if (unlikely(setsockopt(fd, SOL_TCP, TCP_NODELAY, &flags, sizeof(int))))
-            return -1;
+        if (unlikely(setsockopt(fd, SOL_TCP, TCP_NODELAY, &flags, sizeof(int)))) return -1;
     }
 
     // handle URG data inline
     flags = 1;
-    if (unlikely(setsockopt(fd, SOL_SOCKET, SO_OOBINLINE, &flags, sizeof(int))))
-        return -1;
+    if (unlikely(setsockopt(fd, SOL_SOCKET, SO_OOBINLINE, &flags, sizeof(int)))) return -1;
 
     // disable lingering
     struct linger linger = { .l_onoff = 0, .l_linger = 0 };
-    if (unlikely(setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger))))
-        return -1;
+    if (unlikely(setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)))) return -1;
 
     return 0;
 }
@@ -561,15 +556,9 @@ prep_socket (int fd, int is_tcp)
 INLINE_UNLESS_DEBUG static void
 safe_close_conn (struct feer_conn *c, const char *where)
 {
-    if (unlikely(c->fd < 0))
-        return;
-
-    // make it blocking
-    fcntl(c->fd, F_SETFL, 0);
-
-    if (unlikely(close(c->fd)))
-        perror(where);
-
+    if (unlikely(c->fd < 0)) return;
+    fcntl(c->fd, F_SETFL, 0); // make it blocking
+    if (unlikely(close(c->fd))) perror(where);
     c->fd = -1;
 }
 
@@ -616,8 +605,7 @@ INLINE_UNLESS_DEBUG
 static struct feer_conn *
 sv_2feer_conn (SV *rv)
 {
-    if (unlikely(!sv_isa(rv,"Feersum::Connection")))
-       croak("object is not of type Feersum::Connection");
+    if (unlikely(!sv_isa(rv,"Feersum::Connection"))) croak("object is not of type Feersum::Connection");
     return (struct feer_conn *)SvPVX(SvRV(rv));
 }
 
@@ -648,8 +636,7 @@ sv_2feer_conn_handle (SV *rv, bool can_croak)
         return INT2PTR(feer_conn_handle*,uv);
     }
 
-    if (can_croak)
-        croak("Expected a Feersum::Connection::Writer or ::Reader object");
+    if (can_croak) croak("Expected a Feersum::Connection::Writer or ::Reader object");
     return NULL;
 }
 
@@ -671,8 +658,7 @@ new_feer_conn_handle (pTHX_ struct feer_conn *c, bool is_writer)
     if (likely(__from != __to)) { \
         RESPOND_STR(c->responding, _from_str); \
         RESPOND_STR(__to, _to_str); \
-        trace2("==> responding state %d: %s to %s\n", \
-            c->fd,_from_str,_to_str); \
+        trace2("==> responding state %d: %s to %s\n", c->fd,_from_str,_to_str); \
         c->responding = __to; \
     } \
 } while (0)
@@ -683,8 +669,7 @@ new_feer_conn_handle (pTHX_ struct feer_conn *c, bool is_writer)
     if (likely(__from != __to)) { \
         RECEIVE_STR(c->receiving, _from_str); \
         RECEIVE_STR(__to, _to_str); \
-        trace2("==> receiving state %d: %s to %s\n", \
-            c->fd,_from_str,_to_str); \
+        trace2("==> receiving state %d: %s to %s\n", c->fd,_from_str,_to_str); \
         c->receiving = __to; \
     } \
 } while (0)
@@ -1237,8 +1222,6 @@ process_request_headers (struct feer_conn *c, int body_offset)
     c->rbuf = new_rbuf;
     SvCUR_set(req->buf, body_offset);
 
-    if (likely(next_req_follows)) goto got_it_all; // optimize for GET
-
     // determine how much we need to read
     int i;
     UV expected = 0;
@@ -1259,10 +1242,18 @@ process_request_headers (struct feer_conn *c, int body_offset)
                 err = "invalid content-length\n";
                 goto got_bad_request;
             }
+        } else if (
+            unlikely(str_case_eq("connection", 10, hdr->name, hdr->name_len))
+            && likely(str_case_eq("close", 5, hdr->value, hdr->value_len))
+            && c->is_keepalive
+        ) {
+            c->is_keepalive = false;
+            trace("setting conn %d to close after response\n", c->fd);
         }
-        // TODO: support "Connection: close" bodies
         // TODO: support "Transfer-Encoding: chunked" bodies
     }
+
+    if (likely(next_req_follows)) goto got_it_all; // optimize for GET (was before headers processing)
 
     if (body_is_required) {
         // Go the nginx route...
@@ -1281,8 +1272,7 @@ got_bad_request:
 got_cl:
     c->expected_cl = (ssize_t)expected;
     c->received_cl = SvCUR(c->rbuf);
-    trace("expecting body %d size=%"Ssz_df" have=%"Ssz_df"\n",
-        c->fd, (Ssz)c->expected_cl, (Ssz)c->received_cl);
+    trace("expecting body %d size=%"Ssz_df" have=%"Ssz_df"\n", c->fd, (Ssz)c->expected_cl, (Ssz)c->received_cl);
     SvGROW(c->rbuf, c->expected_cl + 1);
 
     // don't have enough bytes to schedule immediately?
@@ -1820,10 +1810,8 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
     }
 
     if (streaming) {
-        if (c->is_http11)
-            add_const_to_wbuf(c, "Transfer-Encoding: chunked" CRLFx2, 30);
-        else
-            add_const_to_wbuf(c, "Connection: close" CRLFx2, 21);
+        if (c->is_http11) add_const_to_wbuf(c, "Transfer-Encoding: chunked" CRLFx2, 30);
+        else add_const_to_wbuf(c, "Connection: close" CRLFx2, 21);
     }
 
     conn_write_ready(c);
