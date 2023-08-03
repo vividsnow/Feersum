@@ -4,7 +4,8 @@ use strict;
 
 use EV;
 use Feersum;
-use Socket qw/SOMAXCONN/;
+use Socket qw/SOMAXCONN IPPROTO_TCP TCP_DEFER_ACCEPT/;
+
 use POSIX ();
 use Scalar::Util qw/weaken/;
 use Carp qw/carp croak/;
@@ -66,6 +67,7 @@ sub _prepare {
             Blocking => 0,
         );
         croak "couldn't bind to socket: $!" unless $sock;
+        setsockopt($sock, IPPROTO_TCP, TCP_DEFER_ACCEPT, 1);
     }
     $self->{sock} = $sock;
     my $f = Feersum->endjinn;
@@ -142,7 +144,7 @@ sub _fork_another {
             EV::break(EV::BREAK_ALL()) unless $self->{_n_kids};
             return;
         }
-        $self->_fork_another();
+        $self->_fork_another($slot);
     };
     return;
 }

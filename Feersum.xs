@@ -9,6 +9,7 @@
 #include <netinet/tcp.h>
 #include <sys/uio.h>
 
+#define PERL_NO_GET_CONTEXT
 #include "ppport.h"
 
 
@@ -532,24 +533,13 @@ http_code_to_msg (int code) {
 static int
 prep_socket (int fd, int is_tcp)
 {
-    int flags;
-    // make it non-blocking
-    flags = O_NONBLOCK;
-    if (unlikely(fcntl(fd, F_SETFL, flags) < 0)) return -1;
+    int flags = 1;
     if (likely(is_tcp)) {
-        // flush writes immediately
-        flags = 1;
         if (unlikely(setsockopt(fd, SOL_TCP, TCP_NODELAY, &flags, sizeof(int)))) return -1;
     }
-
-    // handle URG data inline
-    flags = 1;
     if (unlikely(setsockopt(fd, SOL_SOCKET, SO_OOBINLINE, &flags, sizeof(int)))) return -1;
-
-    // disable lingering
     struct linger linger = { .l_onoff = 0, .l_linger = 0 };
     if (unlikely(setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)))) return -1;
-
     return 0;
 }
 
@@ -1018,7 +1008,7 @@ try_conn_read (EV_P_ ev_io *w, int revents)
     if (likely(c->receiving <= RECEIVE_HEADERS)) {
         int ret = try_parse_http(c, (size_t)got_n);
         if (ret == -1) goto try_read_bad;
-        if (ret == -2) goto try_read_again;
+        if (ret == -2) goto try_read_again_reset_timer;
 
         if (process_request_headers(c, ret))
             goto try_read_again_reset_timer;
@@ -1127,7 +1117,7 @@ accept_cb (EV_P_ ev_io *w, int revents)
     while (1) {
         sa_len = sizeof(struct sockaddr_storage);
         errno = 0;
-        int fd = accept(w->fd, (struct sockaddr *)&sa_buf, &sa_len);
+        int fd = accept4(w->fd, (struct sockaddr *)&sa_buf, &sa_len, SOCK_CLOEXEC|SOCK_NONBLOCK);
         trace("accepted fd=%d, errno=%d\n", fd, errno);
         if (fd == -1) break;
 
@@ -1147,8 +1137,9 @@ accept_cb (EV_P_ ev_io *w, int revents)
         struct sockaddr *sa = (struct sockaddr *)malloc(sa_len);
         memcpy(sa,&sa_buf,(size_t)sa_len);
         struct feer_conn *c = new_feer_conn(EV_A,fd,sa);
-        start_read_watcher(c);
-        restart_read_timer(c);
+        try_conn_read(EV_A, &c->read_ev_io, EV_READ);
+        // start_read_watcher(c);
+        // restart_read_timer(c);
         assert(SvREFCNT(c->self) == 3);
         SvREFCNT_dec(c->self);
     }
