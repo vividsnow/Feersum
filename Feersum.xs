@@ -593,7 +593,7 @@ new_feer_conn (EV_P_ int conn_fd, struct sockaddr *sa)
 
     SvREADONLY_on(self); // turn off later for blessing
     active_conns++;
-    if (unlikely(sem_post(&accept_sem))) { trouble("sem post fail") }
+    if (likely(active_workers) && unlikely(sem_post(&accept_sem))) { trouble("sem post fail") }
     return c;
 }
 
@@ -1118,8 +1118,11 @@ accept_cb (EV_P_ ev_io *w, int revents)
     trace2("accept! revents=0x%08x\n", revents);
 
     while (1) {
-        if (likely(sem_getvalue(&accept_sem, &total_active_conns) == 1)) {
-            if ((float)active_conns > (float)total_active_conns / active_workers) {
+        if (likely(active_workers)) {
+            trace3("going to check overuse");
+            if (unlikely(sem_getvalue(&accept_sem, &total_active_conns))) { trouble("sem get value fail") }
+            else if ((float)active_conns > (float)total_active_conns / active_workers) {
+                trace3("give other %d %d %d", active_workers, active_conns, total_active_conns);
                 break; // give chance to accept to some other worker
             }
         }
@@ -2875,7 +2878,7 @@ DESTROY (struct feer_conn *c)
     if (c->ext_guard) SvREFCNT_dec(c->ext_guard);
 
     active_conns--;
-    if (unlikely(sem_wait(&accept_sem))) { trouble("sem wait fail") };
+    if (likely(active_workers) && unlikely(sem_wait(&accept_sem))) { trouble("sem wait fail") };
 
     if (unlikely(shutting_down && active_conns <= 0)) {
         ev_idle_stop(feersum_ev_loop, &ei);
