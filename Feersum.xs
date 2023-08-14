@@ -8,6 +8,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <sys/uio.h>
+#include <semaphore.h>
 
 #define PERL_NO_GET_CONTEXT
 #include "ppport.h"
@@ -286,6 +287,7 @@ static bool request_cb_is_psgi = 0;
 static SV *shutdown_cb_cv = NULL;
 static bool shutting_down = 0;
 static int active_conns = 0;
+static int active_workers = 0;
 static double read_timeout = READ_TIMEOUT;
 
 static SV *feer_server_name = NULL;
@@ -305,6 +307,10 @@ static SV *psgi_serv10, *psgi_serv11, *crlf_sv;
 // TODO: make this thread-local if and when there are multiple C threads:
 struct ev_loop *feersum_ev_loop = NULL;
 static HV *feersum_tmpl_env = NULL;
+
+// accept mutex
+sem_t accept_sem;
+static int total_active_conns = 0;
 
 INLINE_UNLESS_DEBUG
 static SV*
@@ -587,6 +593,7 @@ new_feer_conn (EV_P_ int conn_fd, struct sockaddr *sa)
 
     SvREADONLY_on(self); // turn off later for blessing
     active_conns++;
+    if (unlikely(sem_post(&accept_sem))) { trouble("sem post fail") }
     return c;
 }
 
@@ -678,8 +685,7 @@ start_read_watcher (struct feer_conn *c) {
 
 INLINE_UNLESS_DEBUG static void
 stop_read_watcher (struct feer_conn *c) {
-    if (unlikely(!ev_is_active(&c->read_ev_io)))
-        return;
+    if (unlikely(!ev_is_active(&c->read_ev_io))) return;
     trace("stop read watcher %d\n",c->fd);
     ev_io_stop(feersum_ev_loop, &c->read_ev_io);
     SvREFCNT_dec(c->self);
@@ -697,8 +703,7 @@ restart_read_timer (struct feer_conn *c) {
 
 INLINE_UNLESS_DEBUG static void
 stop_read_timer (struct feer_conn *c) {
-    if (unlikely(!ev_is_active(&c->read_ev_timer)))
-        return;
+    if (unlikely(!ev_is_active(&c->read_ev_timer))) return;
     trace("stop read timer %d\n",c->fd);
     ev_timer_stop(feersum_ev_loop, &c->read_ev_timer);
     SvREFCNT_dec(c->self);
@@ -706,8 +711,7 @@ stop_read_timer (struct feer_conn *c) {
 
 INLINE_UNLESS_DEBUG static void
 start_write_watcher (struct feer_conn *c) {
-    if (unlikely(ev_is_active(&c->write_ev_io)))
-        return;
+    if (unlikely(ev_is_active(&c->write_ev_io))) return;
     trace("start write watcher %d\n",c->fd);
     ev_io_start(feersum_ev_loop, &c->write_ev_io);
     SvREFCNT_inc_void_NN(c->self);
@@ -715,8 +719,7 @@ start_write_watcher (struct feer_conn *c) {
 
 INLINE_UNLESS_DEBUG static void
 stop_write_watcher (struct feer_conn *c) {
-    if (unlikely(!ev_is_active(&c->write_ev_io)))
-        return;
+    if (unlikely(!ev_is_active(&c->write_ev_io))) return;
     trace("stop write watcher %d\n",c->fd);
     ev_io_stop(feersum_ev_loop, &c->write_ev_io);
     SvREFCNT_dec(c->self);
@@ -1115,6 +1118,11 @@ accept_cb (EV_P_ ev_io *w, int revents)
     trace2("accept! revents=0x%08x\n", revents);
 
     while (1) {
+        if (likely(sem_getvalue(&accept_sem, &total_active_conns) == 1)) {
+            if ((float)active_conns > (float)total_active_conns / active_workers) {
+                break; // give chance to accept to some other worker
+            }
+        }
         sa_len = sizeof(struct sockaddr_storage);
         errno = 0;
         int fd = accept4(w->fd, (struct sockaddr *)&sa_buf, &sa_len, SOCK_CLOEXEC|SOCK_NONBLOCK);
@@ -2243,13 +2251,11 @@ void
 set_server_name_and_port (SV *self, SV *name, SV *port)
     PPCODE:
 {
-    if (feer_server_name)
-        SvREFCNT_dec(feer_server_name);
+    if (feer_server_name) SvREFCNT_dec(feer_server_name);
     feer_server_name = newSVsv(name);
     SvREADONLY_on(feer_server_name);
 
-    if (feer_server_port)
-        SvREFCNT_dec(feer_server_port);
+    if (feer_server_port) SvREFCNT_dec(feer_server_port);
     feer_server_port = newSVsv(port);
     SvREADONLY_on(feer_server_port);
 }
@@ -2258,6 +2264,11 @@ void
 accept_on_fd (SV *self, int fd)
     PPCODE:
 {
+    if (unlikely(sem_init(&accept_sem, 1, 0))) {
+        trouble("fail to init accept mutex for fd=%d\n", fd);
+        return;
+    }
+
     trace("going to accept on %d\n",fd);
     feersum_ev_loop = EV_DEFAULT;
 
@@ -2362,10 +2373,19 @@ set_keepalive (SV *self, SV *set)
 }
 
 void
+set_workers (SV *self, SV *set)
+    PPCODE:
+{
+    trace("set workers %d\n", SvIV(set));
+    active_workers = (int) SvIV(set);
+}
+
+void
 DESTROY (SV *self)
     PPCODE:
 {
     trace3("DESTROY server\n");
+    if (unlikely(sem_destroy(&accept_sem))) trace3("accept mutex free fail\n");
     if (request_cb_cv)
         SvREFCNT_dec(request_cb_cv);
 }
@@ -2855,6 +2875,7 @@ DESTROY (struct feer_conn *c)
     if (c->ext_guard) SvREFCNT_dec(c->ext_guard);
 
     active_conns--;
+    if (unlikely(sem_wait(&accept_sem))) { trouble("sem wait fail") };
 
     if (unlikely(shutting_down && active_conns <= 0)) {
         ev_idle_stop(feersum_ev_loop, &ei);

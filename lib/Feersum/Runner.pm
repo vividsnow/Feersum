@@ -152,6 +152,7 @@ sub _fork_another {
 sub _start_pre_fork {
     my $self = shift;
 
+    $self->{endjinn}->set_workers($self->{pre_fork});
     POSIX::setsid();
 
     $self->{_kids} = [];
