@@ -1118,14 +1118,6 @@ accept_cb (EV_P_ ev_io *w, int revents)
     trace2("accept! revents=0x%08x\n", revents);
 
     while (1) {
-        if (likely(active_workers)) {
-            trace3("going to check overuse");
-            if (unlikely(sem_getvalue(&accept_sem, &total_active_conns))) { trouble("sem get value fail") }
-            else if ((float)active_conns > (float)total_active_conns / active_workers) {
-                trace3("give other %d %d %d", active_workers, active_conns, total_active_conns);
-                break; // give chance to accept to some other worker
-            }
-        }
         sa_len = sizeof(struct sockaddr_storage);
         errno = 0;
         int fd = accept4(w->fd, (struct sockaddr *)&sa_buf, &sa_len, SOCK_CLOEXEC|SOCK_NONBLOCK);
@@ -1153,6 +1145,14 @@ accept_cb (EV_P_ ev_io *w, int revents)
         // restart_read_timer(c);
         assert(SvREFCNT(c->self) == 3);
         SvREFCNT_dec(c->self);
+        if (likely(active_workers)) {
+            trace3("going to check overuse");
+            if (unlikely(sem_getvalue(&accept_sem, &total_active_conns))) { trouble("sem get value fail") }
+            else if (active_conns * active_workers > total_active_conns) {
+                trace3("give other %d %d %d", active_workers, active_conns, total_active_conns);
+                break; // give chance to accept to some other worker
+            }
+        }
     }
 }
 
