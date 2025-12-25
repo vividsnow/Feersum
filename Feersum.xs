@@ -1,4 +1,5 @@
 #include "EVAPI.h"
+
 #define PERL_NO_GET_CONTEXT
 #include "ppport.h"
 #include <stdio.h>
@@ -10,7 +11,11 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <sys/uio.h>
+#include <sys/stat.h>
 #include <time.h>
+#ifdef __linux__
+#include <sys/sendfile.h>
+#endif
 #include "picohttpparser-git/picohttpparser.c"
 
 ///////////////////////////////////////////////////////////////
@@ -143,6 +148,23 @@ struct iomatrix {
     SV *sv[FEERSUM_IOMATRIX_SIZE];
 };
 
+// Free-list for recycling iomatrix structs (avoids malloc/free per response)
+static struct iomatrix *iomatrix_freelist = NULL;
+
+#define IOMATRIX_ALLOC(m_) do { \
+    if (iomatrix_freelist != NULL) { \
+        m_ = iomatrix_freelist; \
+        iomatrix_freelist = *(struct iomatrix **)iomatrix_freelist; \
+    } else { \
+        Newx(m_, 1, struct iomatrix); \
+    } \
+} while(0)
+
+#define IOMATRIX_FREE(m_) do { \
+    *(struct iomatrix **)(m_) = iomatrix_freelist; \
+    iomatrix_freelist = (m_); \
+} while(0)
+
 struct feer_req {
     SV *buf;
     const char* method;
@@ -157,6 +179,24 @@ struct feer_req {
     SV* addr;
     SV* port;
 };
+
+// Free-list for recycling feer_req structs (avoids malloc/free per request)
+static struct feer_req *feer_req_freelist = NULL;
+
+#define FEER_REQ_ALLOC(r_) do { \
+    if (feer_req_freelist != NULL) { \
+        r_ = feer_req_freelist; \
+        feer_req_freelist = *(struct feer_req **)feer_req_freelist; \
+        Zero(r_, 1, struct feer_req); \
+    } else { \
+        Newxz(r_, 1, struct feer_req); \
+    } \
+} while(0)
+
+#define FEER_REQ_FREE(r_) do { \
+    *(struct feer_req **)(r_) = feer_req_freelist; \
+    feer_req_freelist = (r_); \
+} while(0)
 
 enum feer_respond_state {
     RESPOND_NOT_STARTED = 0,
@@ -193,7 +233,7 @@ enum feer_receive_state {
 struct feer_conn {
     SV *self;
     int fd;
-    struct sockaddr *sa;
+    struct sockaddr_storage sa; // embedded to avoid per-connection malloc
 
     struct ev_io read_ev_io;
     struct ev_io write_ev_io;
@@ -209,6 +249,15 @@ struct feer_conn {
     ssize_t expected_cl;
     ssize_t received_cl;
 
+    // cached for keep-alive (avoid recalculation per request)
+    SV *remote_addr;
+    SV *remote_port;
+
+    // sendfile support
+    int sendfile_fd;         // file descriptor for sendfile (-1 if not active)
+    off_t sendfile_off;      // current offset in file
+    size_t sendfile_remain;  // bytes remaining to send
+
     enum feer_respond_state responding;
     enum feer_receive_state receiving;
     bool is_keepalive;
@@ -218,6 +267,7 @@ struct feer_conn {
     unsigned int is_http11:1;
     unsigned int poll_write_cb_is_io_handle:1;
     unsigned int auto_cl:1;
+    unsigned int use_chunked:1;  // true when Transfer-Encoding: chunked is active
 
     ssize_t pipelined;
 };
@@ -290,6 +340,7 @@ static void add_placeholder_to_wbuf (struct feer_conn *c, SV **sv, struct iovec 
 static void uri_decode_sv (SV *sv);
 static bool str_eq(const char *a, int a_len, const char *b, int b_len);
 static bool str_case_eq(const char *a, int a_len, const char *b, int b_len);
+static bool str_case_eq_fixed(const char *a, const char *b, int len);
 static SV* fetch_av_normal (pTHX_ AV *av, I32 i);
 
 static const char *http_code_to_msg (int code);
@@ -311,6 +362,9 @@ static SV *feer_server_name = NULL;
 static SV *feer_server_port = NULL;
 static bool is_tcp = 1;
 static bool is_keepalive = KEEPALIVE_CONNECTION;
+static int read_priority = 0;    // libev watcher priority for read I/O
+static int write_priority = 0;   // libev watcher priority for write I/O
+static int accept_priority = 0;  // libev watcher priority for accept
 
 static ev_io accept_w;
 static ev_prepare ep;
@@ -322,6 +376,35 @@ static struct rinq *request_ready_rinq = NULL;
 static AV *psgi_ver;
 static SV *psgi_serv10, *psgi_serv11, *crlf_sv;
 
+// cached SVs
+static SV *method_GET, *method_POST, *method_HEAD, *method_PUT, *method_DELETE, *method_OPTIONS;
+static SV *status_200, *status_201, *status_204, *status_301, *status_302, *status_304;
+static SV *status_400, *status_404, *status_500;
+static SV *empty_query_sv;
+
+// read buffer SV pool
+#define RBUF_POOL_MAX 16
+static SV *rbuf_pool[RBUF_POOL_MAX];
+static int rbuf_pool_count = 0;
+
+static INLINE_UNLESS_DEBUG SV* rbuf_alloc(const char *src, STRLEN len) {
+    SV *sv;
+    if (rbuf_pool_count > 0) {
+        sv = rbuf_pool[--rbuf_pool_count];
+        sv_setpvn(sv, len > 0 ? src : "", len);
+    } else {
+        sv = newSVpvn(len > 0 ? src : "", len);
+    }
+    return sv;
+}
+
+static INLINE_UNLESS_DEBUG void rbuf_free(SV *sv) {
+    if (rbuf_pool_count < RBUF_POOL_MAX)
+        rbuf_pool[rbuf_pool_count++] = sv;
+    else
+        SvREFCNT_dec(sv);
+}
+
 // TODO: make this thread-local if and when there are multiple C threads:
 struct ev_loop *feersum_ev_loop = NULL;
 static HV *feersum_tmpl_env = NULL;
@@ -332,7 +415,71 @@ static const char *const DAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sa
 static const char *const MONTHS[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-static char DATE_BUF[DATE_HEADER_LENGTH+1] = "Date: The, 01 Jan 1970 00:00:00 GMT\015\012";
+static char DATE_BUF[DATE_HEADER_LENGTH+1] = "Date: Thu, 01 Jan 1970 00:00:00 GMT\015\012";
+
+// Static buffer for HTTP header key transformation (avoids per-request malloc)
+// Size: 5 ("HTTP_") + MAX_HEADER_NAME_LEN
+#define HEADER_KEY_BUFSZ (5 + MAX_HEADER_NAME_LEN)
+static char header_key_buf[HEADER_KEY_BUFSZ] = "HTTP_";
+
+// ASCII case conversion lookup tables (faster than tolower/toupper function calls)
+static const unsigned char ascii_lower[256] = {
+    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+    16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+    32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+    48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+    64,'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o',
+    'p','q','r','s','t','u','v','w','x','y','z',91,92,93,94,95,
+    96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,
+    112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,
+    128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,
+    144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+    160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,
+    176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+    192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,
+    208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+    224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,
+    240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+};
+
+static const unsigned char ascii_upper[256] = {
+    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+    16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+    32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+    48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+    64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,
+    80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+    96,'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O',
+    'P','Q','R','S','T','U','V','W','X','Y','Z',123,124,125,126,127,
+    128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,
+    144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+    160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,
+    176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+    192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,
+    208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+    224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,
+    240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+};
+
+// Hex decode lookup table: maps '0'-'9', 'A'-'F', 'a'-'f' to 0-15, others to -1 (0xFF)
+static const unsigned char hex_decode_table[256] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0,1,2,3,4,5,6,7,8,9,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,  // '0'-'9'
+    0xFF,10,11,12,13,14,15,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,  // 'A'-'F'
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,10,11,12,13,14,15,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,  // 'a'-'f'
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+};
 static time_t LAST_GENERATED_TIME = 0;
 
 static INLINE_UNLESS_DEBUG void uint_to_str(unsigned int value, char *str) {
@@ -345,6 +492,39 @@ static INLINE_UNLESS_DEBUG void uint_to_str_4digits(unsigned int value, char *st
     str[1] = (value / 100) % 10 + '0';
     str[2] = (value / 10) % 10 + '0';
     str[3] = value % 10 + '0';
+}
+
+// Fast Content-Length header formatting (avoids sv_setpvf overhead)
+// Buffer must be at least 32 bytes. Returns length written.
+static INLINE_UNLESS_DEBUG int
+format_content_length(char *buf, size_t len)
+{
+    // "Content-Length: " = 16 chars, "\r\n\r\n" = 4 chars
+    static const char prefix[] = "Content-Length: ";
+    memcpy(buf, prefix, 16);
+
+    char *p = buf + 16;
+
+    // Convert number to string (reverse)
+    if (len == 0) {
+        *p++ = '0';
+    } else {
+        char tmp[20];
+        char *t = tmp;
+        while (len > 0) {
+            *t++ = '0' + (len % 10);
+            len /= 10;
+        }
+        // Reverse into buffer
+        while (t > tmp) {
+            *p++ = *--t;
+        }
+    }
+
+    // Add CRLF CRLF
+    *p++ = '\r'; *p++ = '\n'; *p++ = '\r'; *p++ = '\n';
+
+    return p - buf;
 }
 
 INLINE_UNLESS_DEBUG
@@ -410,9 +590,8 @@ next_iomatrix (struct feer_conn *c)
     }
 
     if (add_iomatrix) {
-        trace3("next_iomatrix(%d): malloc\n", c->fd);
-        Newx(m,1,struct iomatrix);
-        Poison(m,1,struct iomatrix);
+        trace3("next_iomatrix(%d): alloc\n", c->fd);
+        IOMATRIX_ALLOC(m);
         m->offset = m->count = 0;
         rinq_push(&c->wbuf_rinq, m);
     }
@@ -502,7 +681,7 @@ INLINE_UNLESS_DEBUG
 static void
 finish_wbuf(struct feer_conn *c)
 {
-    if (!c->is_http11) return; // nothing required
+    if (!c->use_chunked) return; // nothing required unless chunked encoding
     add_const_to_wbuf(c, "0\r\n\r\n", 5); // terminating chunk
 }
 
@@ -642,11 +821,36 @@ prep_socket(int fd, int is_tcp)
     return 0;
 }
 
+// TCP cork/uncork for batching writes (Linux: TCP_CORK, BSD: TCP_NOPUSH)
+#if defined(TCP_CORK)
+# define FEERSUM_TCP_CORK TCP_CORK
+#elif defined(TCP_NOPUSH)
+# define FEERSUM_TCP_CORK TCP_NOPUSH
+#endif
+
+#ifdef FEERSUM_TCP_CORK
+INLINE_UNLESS_DEBUG static void
+set_cork(int fd, int cork)
+{
+    if (likely(is_tcp)) {
+        setsockopt(fd, SOL_TCP, FEERSUM_TCP_CORK, &cork, sizeof(cork));
+    }
+}
+#else
+# define set_cork(fd, cork) ((void)0)
+#endif
+
 INLINE_UNLESS_DEBUG static void
 safe_close_conn(struct feer_conn *c, const char *where)
 {
     if (unlikely(c->fd < 0))
         return;
+
+    // Clean up any pending sendfile
+    if (c->sendfile_fd >= 0) {
+        close(c->sendfile_fd);
+        c->sendfile_fd = -1;
+    }
 
     // make it blocking
     fcntl(c->fd, F_SETFL, 0);
@@ -658,7 +862,7 @@ safe_close_conn(struct feer_conn *c, const char *where)
 }
 
 static struct feer_conn *
-new_feer_conn (EV_P_ int conn_fd, struct sockaddr *sa)
+new_feer_conn (EV_P_ int conn_fd, struct sockaddr *sa, socklen_t sa_len)
 {
     SV *self = newSV(0);
     SvUPGRADE(self, SVt_PVMG); // ensures sv_bless doesn't reallocate
@@ -672,17 +876,20 @@ new_feer_conn (EV_P_ int conn_fd, struct sockaddr *sa)
 
     c->self = self;
     c->fd = conn_fd;
-    c->sa = sa;
+    memcpy(&c->sa, sa, sa_len); // copy into embedded storage
     c->responding = RESPOND_NOT_STARTED;
     c->receiving = RECEIVE_HEADERS;
     c->is_keepalive = 0;
     c->reqs = 0;
     c->pipelined = 0;
+    c->sendfile_fd = -1; // no sendfile pending
 
     ev_io_init(&c->read_ev_io, try_conn_read, conn_fd, EV_READ);
+    ev_set_priority(&c->read_ev_io, read_priority);
     c->read_ev_io.data = (void *)c;
 
     ev_init(&c->read_ev_timer, conn_read_timeout);
+    ev_set_priority(&c->read_ev_timer, read_priority);
     c->read_ev_timer.data = (void *)c;
 
     trace3("made conn fd=%d self=%p, c=%p, cur=%"Sz_uf", len=%"Sz_uf"\n",
@@ -916,6 +1123,12 @@ try_conn_write(EV_P_ struct ev_io *w, int revents)
         if (unlikely(c->responding >= RESPOND_SHUTDOWN))
             goto try_write_finished;
 
+#ifdef __linux__
+        // Check for sendfile pending (headers already sent)
+        if (c->sendfile_fd >= 0)
+            goto try_sendfile;
+#endif
+
         if (!c->poll_write_cb) {
             // no callback and no data: wait for app to push to us.
             if (c->responding == RESPOND_STREAMING)
@@ -986,14 +1199,70 @@ try_write_again_immediately:
     if (likely(m->offset >= m->count)) {
         trace2("all done with iomatrix %d state=%d\n",w->fd,c->responding);
         rinq_shift(&c->wbuf_rinq);
-        Safefree(m);
-        if (!c->wbuf_rinq)
+        IOMATRIX_FREE(m);
+        if (!c->wbuf_rinq) {
+#ifdef __linux__
+            // sendfile pending? do zero-copy file transfer
+            if (c->sendfile_fd >= 0)
+                goto try_sendfile;
+#endif
             goto try_write_finished;
+        }
         trace2("write again immediately %d state=%d\n",w->fd,c->responding);
         goto try_write_again_immediately;
     }
     // else, fallthrough:
     trace2("write fallthrough %d state=%d\n",w->fd,c->responding);
+    goto try_write_again;
+
+#ifdef __linux__
+try_sendfile:
+    {
+        trace("sendfile %d: fd=%d off=%ld remain=%zu\n",
+            w->fd, c->sendfile_fd, (long)c->sendfile_off, c->sendfile_remain);
+        ssize_t sent = sendfile(w->fd, c->sendfile_fd,
+                                &c->sendfile_off, c->sendfile_remain);
+        if (sent > 0) {
+            c->sendfile_remain -= sent;
+            trace("sendfile sent %zd, remain=%zu\n", sent, c->sendfile_remain);
+            if (c->sendfile_remain == 0) {
+                // Done with sendfile
+                close(c->sendfile_fd);
+                c->sendfile_fd = -1;
+                // For streaming responses, transition to shutdown
+                // Note: DON'T call finish_wbuf - sendfile uses Content-Length, not chunked
+                if (c->responding == RESPOND_STREAMING) {
+                    change_responding_state(c, RESPOND_SHUTDOWN);
+                }
+                goto try_write_finished;
+            }
+            // More to send, wait for socket to be writable again
+            goto try_write_again;
+        }
+        else if (sent == 0) {
+            // EOF on file (shouldn't happen if sendfile_remain was correct)
+            close(c->sendfile_fd);
+            c->sendfile_fd = -1;
+            if (c->responding == RESPOND_STREAMING) {
+                change_responding_state(c, RESPOND_SHUTDOWN);
+            }
+            goto try_write_finished;
+        }
+        else {
+            // sent < 0, error
+            if (errno == EAGAIN || errno == EINTR) {
+                // Socket not ready, wait
+                goto try_write_again;
+            }
+            // Real error
+            perror("Feersum sendfile");
+            close(c->sendfile_fd);
+            c->sendfile_fd = -1;
+            change_responding_state(c, RESPOND_SHUTDOWN);
+            goto try_write_finished;
+        }
+    }
+#endif
 
 try_write_again:
     trace("write again %d state=%d\n",w->fd,c->responding);
@@ -1025,25 +1294,38 @@ try_write_paused:
     goto try_write_cleanup;
 
 try_write_shutdown:
+    set_cork(c->fd, 0);
+
     if (likely(c->is_keepalive)) {
         trace3("write SHUTDOWN, but KEEP %d, refcnt=%d, state=%d\n", c->fd, SvREFCNT(c->self), c->responding);
         stop_write_watcher(c);
         change_responding_state(c, RESPOND_NOT_STARTED);
         change_receiving_state(c, RECEIVE_WAIT);
+        ssize_t pipelined = 0;
+        if (c->rbuf) { pipelined = SvCUR(c->rbuf); }
         if (likely(c->req)) {
-            if (c->req->buf) SvREFCNT_dec(c->req->buf);
+            // reuse req->buf for next request, pool the empty c->rbuf
+            if (likely(pipelined == 0) && c->req->buf && c->rbuf) {
+                SV *tmp = c->rbuf;
+                c->rbuf = c->req->buf;
+                c->req->buf = NULL;
+                SvCUR_set(c->rbuf, 0);
+                rbuf_free(tmp);
+            } else if (c->req->buf) {
+                rbuf_free(c->req->buf);
+            }
             if (likely(c->req->path)) SvREFCNT_dec(c->req->path);
             if (likely(c->req->query)) SvREFCNT_dec(c->req->query);
             if (likely(c->req->addr)) SvREFCNT_dec(c->req->addr);
             if (likely(c->req->port)) SvREFCNT_dec(c->req->port);
-            Safefree(c->req);
+            FEER_REQ_FREE(c->req);
         }
         c->req = NULL;
-        ssize_t pipelined = 0;
-        if (c->rbuf) { pipelined = SvCUR(c->rbuf); }
         if (unlikely(pipelined > 0 && c->is_http11)) {
             trace3("connections has pipelined data on %d\n", c->fd);
             c->pipelined = pipelined;
+            // Process pipelined request immediately - recursion is bounded
+            // by max pipelined requests which is typically small (1-3)
             try_conn_read(EV_A, &c->read_ev_io, 0);
         } else {
             c->pipelined = 0;
@@ -1068,7 +1350,7 @@ try_parse_http(struct feer_conn *c, size_t last_read)
 {
     struct feer_req *req = c->req;
     if (likely(!req)) {
-        Newxz(req,1,struct feer_req);
+        FEER_REQ_ALLOC(req);
         c->req = req;
     }
 
@@ -1286,9 +1568,7 @@ accept_cb (EV_P_ ev_io *w, int revents)
             continue;
         }
 
-        struct sockaddr *sa = (struct sockaddr *)malloc(sa_len);
-        memcpy(sa,&sa_buf,(size_t)sa_len);
-        struct feer_conn *c = new_feer_conn(EV_A,fd,sa);
+        struct feer_conn *c = new_feer_conn(EV_A, fd, (struct sockaddr *)&sa_buf, sa_len);
 #ifdef TCP_DEFER_ACCEPT
         try_conn_read(EV_A, &c->read_ev_io, EV_READ);
         assert(SvREFCNT(c->self) <= 3);
@@ -1327,7 +1607,7 @@ process_request_headers (struct feer_conn *c, int body_offset)
     struct feer_req *req = c->req;
 
     trace("processing headers %d minor_version=%d\n",c->fd,req->minor_version);
-    bool body_is_required;
+    bool body_is_required = 0;
     bool next_req_follows = 0;
     bool got_content_length = 0;
 
@@ -1337,27 +1617,42 @@ process_request_headers (struct feer_conn *c, int body_offset)
 
     change_receiving_state(c, RECEIVE_BODY);
 
-    if (likely(str_eq("GET", 3, req->method, req->method_len))) {
-        // Not supposed to have a body.  Additional bytes are either a
-        // mistake, a websocket negotiation or pipelined requests under
-        // HTTP/1.1
-        next_req_follows = 1;
-    }
-    else if (likely(str_eq("OPTIONS", 7, req->method, req->method_len))) {
-        next_req_follows = 1;
-    }
-    else if (likely(str_eq("POST", 4, req->method, req->method_len))) {
-        body_is_required = 1;
-    }
-    else if (str_eq("PUT", 3, req->method, req->method_len)) {
-        body_is_required = 1;
-    }
-    else if (str_eq("HEAD", 4, req->method, req->method_len) ||
-             str_eq("DELETE", 6, req->method, req->method_len))
-    {
-        next_req_follows = 1;
-    }
-    else {
+    // Dispatch by method length first to minimize string comparisons
+    switch (req->method_len) {
+    case 3:
+        if (likely(memcmp(req->method, "GET", 3) == 0)) {
+            next_req_follows = 1;
+        } else if (memcmp(req->method, "PUT", 3) == 0) {
+            body_is_required = 1;
+        } else {
+            goto unsupported_method;
+        }
+        break;
+    case 4:
+        if (likely(memcmp(req->method, "POST", 4) == 0)) {
+            body_is_required = 1;
+        } else if (memcmp(req->method, "HEAD", 4) == 0) {
+            next_req_follows = 1;
+        } else {
+            goto unsupported_method;
+        }
+        break;
+    case 6:
+        if (memcmp(req->method, "DELETE", 6) == 0) {
+            next_req_follows = 1;
+        } else {
+            goto unsupported_method;
+        }
+        break;
+    case 7:
+        if (memcmp(req->method, "OPTIONS", 7) == 0) {
+            next_req_follows = 1;
+        } else {
+            goto unsupported_method;
+        }
+        break;
+    default:
+    unsupported_method:
         err = "Feersum doesn't support that method yet\n";
         err_code = 405;
         goto got_bad_request;
@@ -1379,7 +1674,7 @@ process_request_headers (struct feer_conn *c, int body_offset)
     int new_alloc = (need > READ_INIT_FACTOR*READ_BUFSZ)
         ? need : READ_INIT_FACTOR*READ_BUFSZ-1;
     trace("new rbuf for body %d need=%d alloc=%d\n",c->fd, need, new_alloc);
-    SV *new_rbuf = newSVpvn(need ? from : "", need);
+    SV *new_rbuf = rbuf_alloc(from, need);
 
     req->buf = c->rbuf;
     c->rbuf = new_rbuf;
@@ -1388,12 +1683,12 @@ process_request_headers (struct feer_conn *c, int body_offset)
     // determine how much we need to read
     int i;
     UV expected = 0;
+    bool got_connection = 0;
     for (i=0; i < req->num_headers; i++) {
         struct phr_header *hdr = &req->headers[i];
         if (!hdr->name) continue;
-        // XXX: ignore multiple C-L headers?
-        if (unlikely(
-             str_case_eq("content-length", 14, hdr->name, hdr->name_len)))
+        if (unlikely(hdr->name_len == 14 &&
+             str_case_eq_fixed("content-length", hdr->name, 14)))
         {
             int g = grok_number(hdr->value, hdr->value_len, &expected);
             if (likely(g == IS_NUMBER_IN_UV)) {
@@ -1402,8 +1697,8 @@ process_request_headers (struct feer_conn *c, int body_offset)
                     err = "Content length exceeds maximum\n";
                     goto got_bad_request;
                 }
-                else
-                    got_content_length = 1;
+                got_content_length = 1;
+                if (got_connection) break;
             }
             else {
                 err_code = 400;
@@ -1411,25 +1706,25 @@ process_request_headers (struct feer_conn *c, int body_offset)
                 goto got_bad_request;
             }
         }
-        else if (
-            unlikely(str_case_eq("connection", 10, hdr->name, hdr->name_len)))
+        else if (unlikely(hdr->name_len == 10 &&
+                str_case_eq_fixed("connection", hdr->name, 10)))
         {
-            if (likely(c->is_http11)
-                && likely(c->is_keepalive)
-                && likely(str_case_eq("close", 5, hdr->value, hdr->value_len)))
+            got_connection = 1;
+            if (likely(c->is_http11) && likely(c->is_keepalive) &&
+                hdr->value_len == 5 && str_case_eq_fixed("close", hdr->value, 5))
             {
                 c->is_keepalive = 0;
                 trace("setting conn %d to close after response\n", c->fd);
             }
-            else if (
-                likely(!c->is_http11)
-                && likely(is_keepalive)
-                && str_case_eq("keep-alive", 10, hdr->value, hdr->value_len))
+            else if (!c->is_http11 && is_keepalive &&
+                hdr->value_len == 10 && str_case_eq_fixed("keep-alive", hdr->value, 10))
             {
                 c->is_keepalive = 1;
                 trace("setting conn %d to keep after response\n", c->fd);
             }
+            if (got_content_length || next_req_follows) break;
         }
+        // TODO: support "Expect: 100-continue" header
         // TODO: support "Transfer-Encoding: chunked" bodies
     }
 
@@ -1466,6 +1761,8 @@ got_cl:
     // don't have enough bytes to schedule immediately?
     // unlikely = optimize for short requests
     if (unlikely(c->expected_cl && c->received_cl < c->expected_cl)) {
+        // TODO: if Expect: 100-continue was received, send 100 Continue
+        // response here. Requires careful coordination with event loop.
         // TODO: schedule the callback immediately and support a non-blocking
         // ->read method.
         // sched_request_callback(c);
@@ -1485,6 +1782,7 @@ conn_write_ready (struct feer_conn *c)
 
     if (c->write_ev_io.data == NULL) {
         ev_io_init(&c->write_ev_io, try_conn_write, c->fd, EV_WRITE);
+        ev_set_priority(&c->write_ev_io, write_priority);
         c->write_ev_io.data = (void *)c;
     }
 
@@ -1535,11 +1833,7 @@ str_eq(const char *a, int a_len, const char *b, int b_len)
 {
     if (a_len != b_len) return 0;
     if (a == b) return 1;
-    int i;
-    for (i=0; i<a_len && i<b_len; i++) {
-        if (a[i] != b[i]) return 0;
-    }
-    return 1;
+    return memcmp(a, b, a_len) == 0;
 }
 
 /*
@@ -1551,23 +1845,28 @@ str_case_eq(const char *a, int a_len, const char *b, int b_len)
     if (a_len != b_len) return 0;
     if (a == b) return 1;
     int i;
-    for (i=0; i<a_len && i<b_len; i++) {
-        if (a[i] != tolower(b[i])) return 0;
+    for (i=0; i<a_len; i++) {
+        if (a[i] != ascii_lower[(unsigned char)b[i]]) return 0;
     }
     return 1;
 }
 
-INLINE_UNLESS_DEBUG int
-hex_decode(const char ch)
+/*
+ * Fixed-length case-insensitive comparison (no length check needed)
+ * For use when lengths are already verified to match
+ */
+INLINE_UNLESS_DEBUG bool
+str_case_eq_fixed(const char *a, const char *b, int len)
 {
-    if (likely('0' <= ch && ch <= '9'))
-        return ch - '0';
-    else if ('A' <= ch && ch <= 'F')
-        return ch - 'A' + 10;
-    else if ('a' <= ch && ch <= 'f')
-        return ch - 'a' + 10;
-    return -1;
+    int i;
+    for (i=0; i<len; i++) {
+        if (a[i] != ascii_lower[(unsigned char)b[i]]) return 0;
+    }
+    return 1;
 }
+
+// Returns 0-15 for valid hex, 0xFF for invalid (use table lookup for speed)
+#define hex_decode(ch) ((int)(signed char)hex_decode_table[(unsigned char)(ch)])
 
 static void
 uri_decode_sv (SV *sv)
@@ -1610,29 +1909,70 @@ needs_decode:
     SvCUR_set(sv, decoded-ptr);
 }
 
+// populate connection-level addr/port cache (called once per connection)
+INLINE_UNLESS_DEBUG void
+feersum_set_conn_remote_info(pTHX_ struct feer_conn *c)
+{
+    if (c->remote_addr) return;  // already cached
+    struct sockaddr *sa = (struct sockaddr *)&c->sa;
+    switch (sa->sa_family) {
+        case AF_INET: {
+            c->remote_addr = newSV(INET_ADDRSTRLEN);
+            struct sockaddr_in *in = (struct sockaddr_in *)sa;
+            inet_ntop(AF_INET, &in->sin_addr, SvPVX(c->remote_addr), INET_ADDRSTRLEN);
+            SvPOK_on(c->remote_addr);
+            SvCUR_set(c->remote_addr, strlen(SvPVX(c->remote_addr)));
+            c->remote_port = newSViv(ntohs(in->sin_port));
+            break;
+        }
+#ifdef AF_INET6
+        case AF_INET6: {
+            c->remote_addr = newSV(INET6_ADDRSTRLEN);
+            struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)sa;
+            inet_ntop(AF_INET6, &in6->sin6_addr, SvPVX(c->remote_addr), INET6_ADDRSTRLEN);
+            SvPOK_on(c->remote_addr);
+            SvCUR_set(c->remote_addr, strlen(SvPVX(c->remote_addr)));
+            c->remote_port = newSViv(ntohs(in6->sin6_port));
+            break;
+        }
+#endif
+#ifdef AF_UNIX
+        case AF_UNIX:
+            c->remote_addr = newSVpvs("unix");
+            c->remote_port = newSViv(0);
+            break;
+#endif
+        default:
+            c->remote_addr = newSVpvs("unspec");
+            c->remote_port = newSViv(0);
+            break;
+    }
+}
+
+// legacy wrapper for request-level (used by native interface)
 INLINE_UNLESS_DEBUG void
 feersum_set_remote_info(pTHX_ struct feer_req *r, struct sockaddr *sa)
 {
     switch (sa->sa_family) {
-        case AF_INET:
+        case AF_INET: {
             r->addr = newSV(INET_ADDRSTRLEN);
-            SvCUR_set(r->addr, INET_ADDRSTRLEN);
             struct sockaddr_in *in = (struct sockaddr_in *)sa;
             inet_ntop(AF_INET, &in->sin_addr, SvPVX(r->addr), INET_ADDRSTRLEN);
             SvPOK_on(r->addr);
             SvCUR_set(r->addr, strlen(SvPVX(r->addr)));
             r->port = newSViv(ntohs(in->sin_port));
             break;
+        }
 #ifdef AF_INET6
-        case AF_INET6:
+        case AF_INET6: {
             r->addr = newSV(INET6_ADDRSTRLEN);
-            SvCUR_set(r->addr, INET6_ADDRSTRLEN);
             struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)sa;
             inet_ntop(AF_INET6, &in6->sin6_addr, SvPVX(r->addr), INET6_ADDRSTRLEN);
             SvPOK_on(r->addr);
             SvCUR_set(r->addr, strlen(SvPVX(r->addr)));
             r->port = newSViv(ntohs(in6->sin6_port));
             break;
+        }
 #endif
 #ifdef AF_UNIX
         case AF_UNIX:
@@ -1650,6 +1990,31 @@ feersum_set_remote_info(pTHX_ struct feer_req *r, struct sockaddr *sa)
 INLINE_UNLESS_DEBUG static SV*
 feersum_env_method(pTHX_ struct feer_req *r)
 {
+    // Return cached SV for common HTTP methods (avoids newSVpvn per request)
+    // Use length-first dispatch for efficiency
+    switch (r->method_len) {
+        case 3:
+            if (r->method[0] == 'G' && r->method[1] == 'E' && r->method[2] == 'T')
+                return SvREFCNT_inc_simple_NN(method_GET);
+            if (r->method[0] == 'P' && r->method[1] == 'U' && r->method[2] == 'T')
+                return SvREFCNT_inc_simple_NN(method_PUT);
+            break;
+        case 4:
+            if (memcmp(r->method, "POST", 4) == 0)
+                return SvREFCNT_inc_simple_NN(method_POST);
+            if (memcmp(r->method, "HEAD", 4) == 0)
+                return SvREFCNT_inc_simple_NN(method_HEAD);
+            break;
+        case 6:
+            if (memcmp(r->method, "DELETE", 6) == 0)
+                return SvREFCNT_inc_simple_NN(method_DELETE);
+            break;
+        case 7:
+            if (memcmp(r->method, "OPTIONS", 7) == 0)
+                return SvREFCNT_inc_simple_NN(method_OPTIONS);
+            break;
+    }
+    // Uncommon method - create new SV
     return newSVpvn(r->method, r->method_len);
 }
 
@@ -1668,15 +2033,15 @@ feersum_env_protocol(pTHX_ struct feer_req *r)
 INLINE_UNLESS_DEBUG static void
 feersum_set_path_and_query(pTHX_ struct feer_req *r)
 {
-    const char *qpos = r->uri;
-    while (*qpos != '?' && qpos < r->uri + r->uri_len) qpos++;
-    if (*qpos == '?') {
+    // Use memchr for fast SIMD-optimized scanning
+    const char *qpos = (const char *)memchr(r->uri, '?', r->uri_len);
+    if (qpos != NULL) {
         r->path = newSVpvn(r->uri, (qpos - r->uri));
         qpos++;
         r->query = newSVpvn(qpos, r->uri_len - (qpos - r->uri));
     } else {
         r->path = feersum_env_uri(aTHX_ r);
-        r->query = newSVpvs("");
+        r->query = SvREFCNT_inc_simple_NN(empty_query_sv);
     }
     uri_decode_sv(r->path);
 }
@@ -1698,17 +2063,15 @@ feersum_env_query(pTHX_ struct feer_req *r)
 INLINE_UNLESS_DEBUG static SV*
 feersum_env_addr(pTHX_ struct feer_conn *c)
 {
-    struct feer_req *r = c->req;
-    if (unlikely(!r->addr)) feersum_set_remote_info(aTHX_ r, c->sa);
-    return r->addr;
+    feersum_set_conn_remote_info(aTHX_ c);
+    return c->remote_addr;
 }
 
 INLINE_UNLESS_DEBUG static SV*
 feersum_env_port(pTHX_ struct feer_conn *c)
 {
-    struct feer_req *r = c->req;
-    if (unlikely(!r->port)) feersum_set_remote_info(aTHX_ r, c->sa);
-    return r->port;
+    feersum_set_conn_remote_info(aTHX_ c);
+    return c->remote_port;
 }
 
 static void
@@ -1716,6 +2079,8 @@ feersum_init_tmpl_env(pTHX)
 {
     HV *e;
     e = newHV();
+    // Pre-size hash to avoid rehashing (template has ~29 entries, use 32)
+    hv_ksplit(e, 32);
 
     // constants
     hv_stores(e, "psgi.version", newRV((SV*)psgi_ver));
@@ -1782,15 +2147,15 @@ feersum_env(pTHX_ struct feer_conn *c)
     trace("generating header (fd %d) %.*s\n",
         c->fd, (int)r->uri_len, r->uri);
 
-    hv_stores(e, "SERVER_NAME", SvREFCNT_inc_simple(feer_server_name));
-    hv_stores(e, "SERVER_PORT", newSVsv_nomg(feer_server_port));
+    hv_stores(e, "SERVER_NAME", newSVsv(feer_server_name));
+    hv_stores(e, "SERVER_PORT", newSVsv(feer_server_port));
     hv_stores(e, "REQUEST_URI", feersum_env_uri(aTHX_ r));
     hv_stores(e, "REQUEST_METHOD", feersum_env_method(aTHX_ r));
     hv_stores(e, "SERVER_PROTOCOL", SvREFCNT_inc_simple_NN(feersum_env_protocol(aTHX_ r)));
 
-    if (likely(!r->addr)) feersum_set_remote_info(aTHX_ r, c->sa);
-    hv_stores(e, "REMOTE_ADDR", SvREFCNT_inc_simple_NN(r->addr));
-    hv_stores(e, "REMOTE_PORT", SvREFCNT_inc_simple_NN(r->port));
+    feersum_set_conn_remote_info(aTHX_ c);
+    hv_stores(e, "REMOTE_ADDR", newSVsv(c->remote_addr));
+    hv_stores(e, "REMOTE_PORT", newSVsv(c->remote_port));
 
     if (unlikely(c->expected_cl > 0)) {
         hv_stores(e, "CONTENT_LENGTH", newSViv(c->expected_cl));
@@ -1811,10 +2176,7 @@ feersum_env(pTHX_ struct feer_conn *c)
     hv_stores(e, "QUERY_STRING", SvREFCNT_inc_simple_NN(r->query));
 
     SV *val = NULL;
-    char *kbuf;
-    size_t kbuflen = 64;
-    Newx(kbuf, kbuflen, char);
-    kbuf[0]='H'; kbuf[1]='T'; kbuf[2]='T'; kbuf[3]='P'; kbuf[4]='_';
+    char *kbuf = header_key_buf; // use static buffer (pre-initialized with "HTTP_")
 
     for (i=0; i<r->num_headers; i++) {
         struct phr_header *hdr = &(r->headers[i]);
@@ -1823,29 +2185,29 @@ feersum_env(pTHX_ struct feer_conn *c)
             sv_catpvn(val, hdr->value, hdr->value_len);
             continue;
         }
-        else if (unlikely(str_case_eq(
-            STR_WITH_LEN("content-length"), hdr->name, hdr->name_len)))
+        else if (unlikely(hdr->name_len == 14) &&
+            str_case_eq_fixed("content-length", hdr->name, 14))
         {
             // content length shouldn't show up as HTTP_CONTENT_LENGTH but
             // as CONTENT_LENGTH in the env-hash.
             continue;
         }
-        else if (unlikely(str_case_eq(
-            STR_WITH_LEN("content-type"), hdr->name, hdr->name_len)))
+        else if (unlikely(hdr->name_len == 12) &&
+            str_case_eq_fixed("content-type", hdr->name, 12))
         {
             hv_stores(e, "CONTENT_TYPE",newSVpvn(hdr->value, hdr->value_len));
             continue;
         }
 
+        // skip headers with names too long for our buffer
+        if (unlikely(hdr->name_len > MAX_HEADER_NAME_LEN))
+            continue;
+
         size_t klen = 5+hdr->name_len;
-        if (kbuflen < klen) {
-            kbuflen = klen;
-            kbuf = Renew(kbuf, kbuflen, char);
-        }
         char *key = kbuf + 5;
         for (j=0; j<hdr->name_len; j++) {
-            char n = hdr->name[j];
-            *key++ = (n == '-') ? '_' : toupper(n);
+            unsigned char n = hdr->name[j];
+            *key++ = (n == '-') ? '_' : ascii_upper[n];
         }
 
         SV **val = hv_fetch(e, kbuf, klen, 1);
@@ -1864,7 +2226,6 @@ feersum_env(pTHX_ struct feer_conn *c)
             sv_setpvn(*val, hdr->value, hdr->value_len);
         }
     }
-    Safefree(kbuf);
 
     return e;
 }
@@ -1876,9 +2237,9 @@ for (i = 0; i < r->num_headers; i++) {\
         sv_catpvn(*val, hdr->value, hdr->value_len);\
         continue;\
     }\
+    if (unlikely(hdr->name_len > MAX_HEADER_NAME_LEN)) continue;\
     char *k = kbuf;\
     for (j = 0; j < hdr->name_len; j++) { char n = hdr->name[j]; *k++ = _str; }\
-    if (unlikely(kbuflen < hdr->name_len)) { kbuflen = hdr->name_len; kbuf = Renew(kbuf, kbuflen, char); }\
     SV** val = hv_fetch(e, kbuf, hdr->name_len, 1);\
     if (unlikely(SvPOK(*val))) {\
         sv_catpvn(*val, ", ", 2);\
@@ -1889,28 +2250,26 @@ for (i = 0; i < r->num_headers; i++) {\
 }\
 break;
 
+// Static buffer for feersum_env_headers (reuses header_key_buf area after HTTP_ prefix)
 INLINE_UNLESS_DEBUG static HV*
 feersum_env_headers(pTHX_ struct feer_req *r, int norm)
 {
     int i; int j; char* n; HV* e;
     e = newHV();
     SV** val;
-    char *kbuf;
-    size_t kbuflen = 64;
-    Newx(kbuf, kbuflen, char);
+    char *kbuf = header_key_buf + 5; // reuse static buffer, skip the "HTTP_" prefix area
     switch (norm) {
         case HEADER_NORM_SKIP:
             COPY_NORM_HEADER(n)
         case HEADER_NORM_LOCASE:
-            COPY_NORM_HEADER(tolower(n))
+            COPY_NORM_HEADER(ascii_lower[(unsigned char)n])
         case HEADER_NORM_UPCASE:
-            COPY_NORM_HEADER(toupper(n))
+            COPY_NORM_HEADER(ascii_upper[(unsigned char)n])
         case HEADER_NORM_LOCASE_DASH:
-            COPY_NORM_HEADER((n == '-') ? '_' : tolower(n))
+            COPY_NORM_HEADER((n == '-') ? '_' : ascii_lower[(unsigned char)n])
         case HEADER_NORM_UPCASE_DASH:
-            COPY_NORM_HEADER((n == '-') ? '_' : toupper(n))
+            COPY_NORM_HEADER((n == '-') ? '_' : ascii_upper[(unsigned char)n])
     }
-    Safefree(kbuf);
     return e;
 }
 
@@ -1947,12 +2306,15 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
         croak("already responding?!");
     change_responding_state(c, streaming ? RESPOND_STREAMING : RESPOND_NORMAL);
 
+    // Cork the socket to batch header + body writes
+    set_cork(c->fd, 1);
+
     if (unlikely(!SvOK(message) || !(SvIOK(message) || SvPOK(message)))) {
         croak("Must define an HTTP status code or message");
     }
 
     I32 avl = av_len(headers);
-    if (unlikely(avl+1 % 2 == 1)) {
+    if (unlikely((avl+1) % 2 == 1)) {
         croak("expected even-length array, got %d", avl+1);
     }
 
@@ -1974,8 +2336,22 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
 
     // for PSGI it's always just an IV so optimize for that
     if (likely(!SvPOK(message) || SvCUR(message) == 3)) {
-        ptr = http_code_to_msg(code);
-        message = sv_2mortal(newSVpvf("%"UVuf" %s",code,ptr));
+        // Use cached status SVs for common codes to avoid newSVpvf overhead
+        switch (code) {
+            case 200: message = status_200; break;
+            case 201: message = status_201; break;
+            case 204: message = status_204; break;
+            case 301: message = status_301; break;
+            case 302: message = status_302; break;
+            case 304: message = status_304; break;
+            case 400: message = status_400; break;
+            case 404: message = status_404; break;
+            case 500: message = status_500; break;
+            default:
+                ptr = http_code_to_msg(code);
+                message = sv_2mortal(newSVpvf("%"UVuf" %s",code,ptr));
+                break;
+        }
     }
 
     // don't generate or strip Content-Length headers for 304 or 1xx
@@ -1985,31 +2361,34 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
     add_sv_to_wbuf(c, message);
     add_crlf_to_wbuf(c);
 
+    bool has_content_length = 0;
+    SV **ary = AvARRAY(headers);
     for (i=0; i<avl; i+= 2) {
-        SV **hdr = av_fetch(headers, i, 0);
-        if (unlikely(!hdr || !SvOK(*hdr))) {
+        SV *hdr = ary[i];
+        SV *val = ary[i+1];
+        if (unlikely(!hdr || !SvOK(hdr))) {
             trace("skipping undef header key");
             continue;
         }
-
-        SV **val = av_fetch(headers, i+1, 0);
-        if (unlikely(!val || !SvOK(*val))) {
+        if (unlikely(!val || !SvOK(val))) {
             trace("skipping undef header value");
             continue;
         }
 
         STRLEN hlen;
-        const char *hp = SvPV(*hdr, hlen);
-        if (likely(c->auto_cl) &&
-            unlikely(str_case_eq("content-length",14,hp,hlen)))
-        {
-            trace("ignoring content-length header in the response\n");
-            continue;
+        const char *hp = SvPV(hdr, hlen);
+        if (unlikely(hlen == 14) && str_case_eq_fixed("content-length", hp, 14)) {
+            if (likely(c->auto_cl) && !streaming) {
+                trace("ignoring content-length header in the response\n");
+                continue;
+            }
+            // In streaming mode, keep Content-Length (for sendfile support)
+            has_content_length = 1;
         }
 
-        add_sv_to_wbuf(c, *hdr);
+        add_sv_to_wbuf(c, hdr);
         add_const_to_wbuf(c, ": ", 2);
-        add_sv_to_wbuf(c, *val);
+        add_sv_to_wbuf(c, val);
         add_crlf_to_wbuf(c);
     }
 
@@ -2024,12 +2403,17 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
         add_const_to_wbuf(c, "Connection: keep-alive" CRLF, 24);
 
     if (streaming) {
-        if (c->is_http11)
+        // Use chunked encoding only if no Content-Length provided
+        // (Content-Length is used with sendfile for zero-copy file transfer)
+        if (c->is_http11 && !has_content_length) {
             add_const_to_wbuf(c, "Transfer-Encoding: chunked" CRLFx2, 30);
+            c->use_chunked = 1;
+        }
         else {
             add_crlf_to_wbuf(c);
+            c->use_chunked = 0;
             // cant do keep-alive for streaming http/1.0 since client completes read on close
-            if (unlikely(c->is_keepalive)) c->is_keepalive = 0;
+            if (unlikely(c->is_keepalive) && !has_content_length) c->is_keepalive = 0;
         }
     }
 
@@ -2090,7 +2474,9 @@ feersum_write_whole_body (pTHX_ struct feer_conn *c, SV *body)
     }
 
     if (likely(c->auto_cl)) {
-        sv_setpvf(cl_sv, "Content-Length: %"Sz_uf"" CRLFx2, (Sz)RETVAL);
+        char cl_buf[32];
+        int cl_len = format_content_length(cl_buf, RETVAL);
+        sv_setpvn(cl_sv, cl_buf, cl_len);
         update_wbuf_placeholder(c, cl_sv, cl_iov);
     }
 
@@ -2191,7 +2577,7 @@ feersum_close_handle (pTHX_ struct feer_conn *c, bool is_writer)
             c->poll_write_cb = NULL;
         }
         if (c->responding < RESPOND_SHUTDOWN) {
-            finish_wbuf(c);
+            finish_wbuf(c);  // only adds terminator if use_chunked is set
             conn_write_ready(c);
             change_responding_state(c, RESPOND_SHUTDOWN);
         }
@@ -2401,7 +2787,7 @@ pump_io_handle (struct feer_conn *c, SV *io)
         goto done_pump_io;
     }
 
-    if (c->is_http11)
+    if (c->use_chunked)
         add_chunk_sv_to_wbuf(c, ret);
     else
         add_sv_to_wbuf(c, ret);
@@ -2530,6 +2916,7 @@ accept_on_fd(SV *self, int fd)
     ev_idle_init(&ei, idle_cb);
 
     ev_io_init(&accept_w, accept_cb, fd, EV_READ);
+    ev_set_priority(&accept_w, accept_priority);
 }
 
 void
@@ -2619,6 +3006,76 @@ set_keepalive (SV *self, SV *set)
     trace("set keepalive %d\n", SvTRUE(set));
     is_keepalive = SvTRUE(set);
 }
+
+void
+set_epoll_exclusive (SV *self, SV *set)
+    PPCODE:
+{
+#if defined(__linux__) && defined(HAVE_EV_EPOLL_EXCLUSIVE)
+    trace("set epoll_exclusive %d\n", SvTRUE(set));
+    if (GEVAPI->set_epoll_exclusive)
+        GEVAPI->set_epoll_exclusive(feersum_ev_loop, SvTRUE(set) ? 1 : 0);
+    else if (SvTRUE(set))
+        warn("EPOLLEXCLUSIVE requires patched EV module (libev-epollexclusive.patch)");
+#elif defined(__linux__)
+    if (SvTRUE(set))
+        warn("EPOLLEXCLUSIVE requires patched EV module (libev-epollexclusive.patch)");
+#else
+    if (SvTRUE(set))
+        warn("EPOLLEXCLUSIVE is only supported on Linux");
+#endif
+}
+
+int
+read_priority (SV *self, ...)
+    PROTOTYPE: $;$
+    CODE:
+{
+    if (items > 1) {
+        int new_priority = SvIV(ST(1));
+        if (new_priority < EV_MINPRI) new_priority = EV_MINPRI;
+        if (new_priority > EV_MAXPRI) new_priority = EV_MAXPRI;
+        trace("set read_priority %d\n", new_priority);
+        read_priority = new_priority;
+    }
+    RETVAL = read_priority;
+}
+    OUTPUT:
+        RETVAL
+
+int
+write_priority (SV *self, ...)
+    PROTOTYPE: $;$
+    CODE:
+{
+    if (items > 1) {
+        int new_priority = SvIV(ST(1));
+        if (new_priority < EV_MINPRI) new_priority = EV_MINPRI;
+        if (new_priority > EV_MAXPRI) new_priority = EV_MAXPRI;
+        trace("set write_priority %d\n", new_priority);
+        write_priority = new_priority;
+    }
+    RETVAL = write_priority;
+}
+    OUTPUT:
+        RETVAL
+
+int
+accept_priority (SV *self, ...)
+    PROTOTYPE: $;$
+    CODE:
+{
+    if (items > 1) {
+        int new_priority = SvIV(ST(1));
+        if (new_priority < EV_MINPRI) new_priority = EV_MINPRI;
+        if (new_priority > EV_MAXPRI) new_priority = EV_MAXPRI;
+        trace("set accept_priority %d\n", new_priority);
+        accept_priority = new_priority;
+    }
+    RETVAL = accept_priority;
+}
+    OUTPUT:
+        RETVAL
 
 unsigned int
 max_connection_reqs (SV *self, ...)
@@ -2794,7 +3251,7 @@ write (feer_conn_handle *hdl, ...)
     }
     (void)SvPV(body, RETVAL);
 
-    if (c->is_http11)
+    if (c->use_chunked)
         add_chunk_sv_to_wbuf(c, body);
     else
         add_sv_to_wbuf(c, body);
@@ -2816,7 +3273,7 @@ write_array (feer_conn_handle *hdl, AV *abody)
 
     I32 amax = av_len(abody);
     int i;
-    if (c->is_http11) {
+    if (c->use_chunked) {
         for (i=0; i<=amax; i++) {
             SV *sv = fetch_av_normal(aTHX_ abody, i);
             if (likely(sv)) add_chunk_sv_to_wbuf(c, sv);
@@ -2831,6 +3288,90 @@ write_array (feer_conn_handle *hdl, AV *abody)
 
     conn_write_ready(c);
 }
+
+#ifdef __linux__
+void
+sendfile (feer_conn_handle *hdl, SV *fh, ...)
+    PROTOTYPE: $$;$$
+    PPCODE:
+{
+    if (unlikely(c->responding != RESPOND_STREAMING && c->responding != RESPOND_NORMAL))
+        croak("can only call sendfile after starting response");
+
+    // Get file descriptor from filehandle
+    int file_fd = -1;
+    off_t offset = 0;
+    size_t length = 0;
+
+    if (SvIOK(fh)) {
+        // Bare file descriptor
+        file_fd = SvIV(fh);
+    }
+    else if (SvROK(fh) && SvTYPE(SvRV(fh)) == SVt_PVGV) {
+        // Glob reference (filehandle)
+        IO *io = GvIOp(SvRV(fh));
+        if (io && IoIFP(io)) {
+            file_fd = PerlIO_fileno(IoIFP(io));
+        }
+    }
+    else if (SvTYPE(fh) == SVt_PVGV) {
+        // Bare glob
+        IO *io = GvIOp(fh);
+        if (io && IoIFP(io)) {
+            file_fd = PerlIO_fileno(IoIFP(io));
+        }
+    }
+
+    if (file_fd < 0)
+        croak("sendfile: invalid file handle");
+
+    // Get file size for length if not specified
+    struct stat st;
+    if (fstat(file_fd, &st) < 0)
+        croak("sendfile: fstat failed: %s", strerror(errno));
+
+    if (!S_ISREG(st.st_mode))
+        croak("sendfile: not a regular file");
+
+    // Parse optional offset and validate before using
+    if (items >= 3 && SvOK(ST(2))) {
+        offset = (off_t)SvIV(ST(2));
+    }
+
+    if (offset < 0 || offset >= st.st_size)
+        croak("sendfile: offset out of range");
+
+    if (items >= 4 && SvOK(ST(3))) {
+        length = (size_t)SvUV(ST(3));
+    } else {
+        // Default: send from offset to end of file
+        length = st.st_size - offset;
+    }
+
+    if (length == 0) {
+        // Nothing to send, just return
+        XSRETURN_EMPTY;
+    }
+
+    trace("sendfile setup: fd=%d file_fd=%d off=%ld len=%zu\n",
+        c->fd, file_fd, (long)offset, length);
+
+    // Dup the fd so we own it (caller can close their handle)
+    c->sendfile_fd = dup(file_fd);
+    if (c->sendfile_fd < 0)
+        croak("sendfile: dup failed: %s", strerror(errno));
+
+    c->sendfile_off = offset;
+    c->sendfile_remain = length;
+
+    // If we have an auto content-length response (RESPOND_NORMAL with no streaming),
+    // we need to add the length to headers before sendfile
+    // For streaming, headers are already sent
+
+    conn_write_ready(c);
+    XSRETURN_EMPTY;
+}
+#endif
 
 int
 seek (feer_conn_handle *hdl, ssize_t offset, ...)
@@ -3150,20 +3691,21 @@ DESTROY (struct feer_conn *c)
             for (i=0; i < m->count; i++) {
                 if (m->sv[i]) SvREFCNT_dec(m->sv[i]);
             }
-            Safefree(m);
+            IOMATRIX_FREE(m);
         }
     }
 
     if (likely(c->req)) {
-        if (c->req->buf) SvREFCNT_dec(c->req->buf);
+        if (c->req->buf) rbuf_free(c->req->buf);
         if (likely(c->req->path)) SvREFCNT_dec(c->req->path);
         if (likely(c->req->query)) SvREFCNT_dec(c->req->query);
         if (likely(c->req->addr)) SvREFCNT_dec(c->req->addr);
         if (likely(c->req->port)) SvREFCNT_dec(c->req->port);
-        Safefree(c->req);
+        FEER_REQ_FREE(c->req);
     }
 
-    if (likely(c->sa)) free(c->sa);
+    if (c->remote_addr) SvREFCNT_dec(c->remote_addr);
+    if (c->remote_port) SvREFCNT_dec(c->remote_port);
 
     safe_close_conn(c, "close at destruction");
 
@@ -3210,6 +3752,41 @@ BOOT:
         SvREADONLY_on(psgi_serv10);
         psgi_serv11 = newSVpvs("HTTP/1.1");
         SvREADONLY_on(psgi_serv11);
+
+        method_GET = newSVpvs("GET");
+        SvREADONLY_on(method_GET);
+        method_POST = newSVpvs("POST");
+        SvREADONLY_on(method_POST);
+        method_HEAD = newSVpvs("HEAD");
+        SvREADONLY_on(method_HEAD);
+        method_PUT = newSVpvs("PUT");
+        SvREADONLY_on(method_PUT);
+        method_DELETE = newSVpvs("DELETE");
+        SvREADONLY_on(method_DELETE);
+        method_OPTIONS = newSVpvs("OPTIONS");
+        SvREADONLY_on(method_OPTIONS);
+
+        status_200 = newSVpvs("200 OK");
+        SvREADONLY_on(status_200);
+        status_201 = newSVpvs("201 Created");
+        SvREADONLY_on(status_201);
+        status_204 = newSVpvs("204 No Content");
+        SvREADONLY_on(status_204);
+        status_301 = newSVpvs("301 Moved Permanently");
+        SvREADONLY_on(status_301);
+        status_302 = newSVpvs("302 Found");
+        SvREADONLY_on(status_302);
+        status_304 = newSVpvs("304 Not Modified");
+        SvREADONLY_on(status_304);
+        status_400 = newSVpvs("400 Bad Request");
+        SvREADONLY_on(status_400);
+        status_404 = newSVpvs("404 Not Found");
+        SvREADONLY_on(status_404);
+        status_500 = newSVpvs("500 Internal Server Error");
+        SvREADONLY_on(status_500);
+
+        empty_query_sv = newSVpvs("");
+        SvREADONLY_on(empty_query_sv);
 
         Zero(&psgix_io_vtbl, 1, MGVTBL);
         psgix_io_vtbl.svt_get = psgix_io_svt_get;

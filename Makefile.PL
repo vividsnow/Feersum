@@ -69,6 +69,23 @@ if ($convert_deps) {
 use Config;
 my $steal = ($] >= 5.012 && !defined($Config{useithreads}));
 
+# Check if EV has EPOLLEXCLUSIVE support (patched EV)
+my $has_ev_epoll_exclusive = 0;
+{
+    local $@;
+    eval {
+        require EV;
+        my $evapi_path = $INC{'EV.pm'};
+        $evapi_path =~ s/\.pm$/\/EVAPI.h/;
+        if (open my $fh, '<', $evapi_path) {
+            local $/;
+            my $content = <$fh>;
+            close $fh;
+            $has_ev_epoll_exclusive = 1 if $content =~ /set_epoll_exclusive/;
+        }
+    };
+}
+
 WriteMakefile(ev_args(
     NAME          => 'Feersum',
     VERSION_FROM  => 'lib/Feersum.pm',
@@ -104,7 +121,10 @@ WriteMakefile(ev_args(
     },
     LIBS   => [''],
     EXE_FILES => ['bin/feersum'],
-    DEFINE => ($steal ? '-DFEERSUM_STEAL' : ''),
+    DEFINE => join(' ',
+        ($steal ? '-DFEERSUM_STEAL' : ()),
+        ($has_ev_epoll_exclusive ? '-DHAVE_EV_EPOLL_EXCLUSIVE' : ()),
+    ),
     INC    => '-I.',
     dynamic_lib => {OTHERLDFLAGS => $otherldflags},
 ));

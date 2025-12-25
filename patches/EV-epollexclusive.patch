@@ -1,0 +1,140 @@
+EPOLLEXCLUSIVE patch for EV/libev - Linux 4.5+
+
+This patch adds EPOLLEXCLUSIVE support to libev and exposes it through the EV API.
+EPOLLEXCLUSIVE causes only ONE epoll waiter to be woken when an event occurs,
+solving the thundering herd problem for accept() in prefork servers.
+
+Apply to EV-4.36 (or later) with: patch -p1 < libev-epollexclusive-clean.patch
+
+diff --git a/libev/ev_vars.h b/libev/ev_vars.h
+--- a/libev/ev_vars.h
++++ b/libev/ev_vars.h
+@@ -105,6 +105,7 @@ VARx(int, epoll_eventmax)
+ VARx(int *, epoll_eperms)
+ VARx(int, epoll_epermcnt)
+ VARx(int, epoll_epermmax)
++VARx(int, epoll_exclusive)  /* enable EPOLLEXCLUSIVE for new watchers */
+ #endif
+
+ #if EV_USE_LINUXAIO || EV_GENWRAP
+diff --git a/libev/ev_epoll.c b/libev/ev_epoll.c
+--- a/libev/ev_epoll.c
++++ b/libev/ev_epoll.c
+@@ -65,6 +65,11 @@
+
+ #include <sys/epoll.h>
+
++/* EPOLLEXCLUSIVE was added in Linux 4.5 */
++#ifndef EPOLLEXCLUSIVE
++# define EPOLLEXCLUSIVE (1u << 28)
++#endif
++
+ #define EV_EMASK_EPERM 0x80
+
+ static void
+@@ -90,8 +95,16 @@ epoll_modify (EV_P_ int fd, int oev, int nev)
+   /* store the generation counter in the upper 32 bits, the fd in the lower 32 bits */
+   ev.data.u64 = (uint64_t)(uint32_t)fd
+               | ((uint64_t)(uint32_t)++anfds [fd].egen << 32);
+-  ev.events   = (nev & EV_READ  ? EPOLLIN  : 0)
+-              | (nev & EV_WRITE ? EPOLLOUT : 0);
++  ev.events = (nev & EV_READ  ? EPOLLIN  : 0)
++            | (nev & EV_WRITE ? EPOLLOUT : 0);
++
++  /*
++   * EPOLLEXCLUSIVE can only be set with EPOLL_CTL_ADD, not EPOLL_CTL_MOD.
++   * It causes only one epoll fd to be woken when the event occurs,
++   * which solves the thundering herd problem for accept() in prefork servers.
++   */
++  if (epoll_exclusive && !(oev && oldmask != nev))
++    ev.events |= EPOLLEXCLUSIVE;
+
+   if (ecb_expect_true (!epoll_ctl (backend_fd, oev && oldmask != nev ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, fd, &ev)))
+     return;
+diff --git a/libev/ev.c b/libev/ev.c
+--- a/libev/ev.c
++++ b/libev/ev.c
+@@ -3201,6 +3201,20 @@ ev_backend (EV_P) EV_NOEXCEPT
+   return backend;
+ }
+
++#if EV_USE_EPOLL
++void
++ev_set_epoll_exclusive (EV_P_ int enable) EV_NOEXCEPT
++{
++  epoll_exclusive = enable;
++}
++
++int
++ev_epoll_exclusive (EV_P) EV_NOEXCEPT
++{
++  return epoll_exclusive;
++}
++#endif
++
+ #if EV_FEATURE_API
+ unsigned int
+ ev_iteration (EV_P) EV_NOEXCEPT
+diff --git a/libev/ev.h b/libev/ev.h
+--- a/libev/ev.h
++++ b/libev/ev.h
+@@ -669,6 +669,13 @@ EV_API_DECL void ev_set_timeout_collect_interval (EV_P_ ev_tstamp interval) EV_N
+ /* advanced stuff for threading etc. support, see docs */
+ EV_API_DECL void ev_set_userdata (EV_P_ void *data) EV_NOEXCEPT;
+ EV_API_DECL void *ev_userdata (EV_P) EV_NOEXCEPT;
++
++/* EPOLLEXCLUSIVE support (Linux 4.5+) - reduces thundering herd for accept() */
++#if EV_USE_EPOLL
++EV_API_DECL void ev_set_epoll_exclusive (EV_P_ int enable) EV_NOEXCEPT;
++EV_API_DECL int ev_epoll_exclusive (EV_P) EV_NOEXCEPT;
++#endif
++
+ typedef void (*ev_loop_callback)(EV_P);
+ EV_API_DECL void ev_set_invoke_pending_cb (EV_P_ ev_loop_callback invoke_pending_cb) EV_NOEXCEPT;
+ /* C++ doesn't allow the use of the ev_loop_callback typedef here, so we need to spell it out */
+diff --git a/libev/ev_wrap.h b/libev/ev_wrap.h
+--- a/libev/ev_wrap.h
++++ b/libev/ev_wrap.h
+@@ -26,6 +26,7 @@
+ #define epoll_eperms ((loop)->epoll_eperms)
+ #define epoll_eventmax ((loop)->epoll_eventmax)
+ #define epoll_events ((loop)->epoll_events)
++#define epoll_exclusive ((loop)->epoll_exclusive)
+ #define evpipe ((loop)->evpipe)
+ #define fdchangecnt ((loop)->fdchangecnt)
+ #define fdchangemax ((loop)->fdchangemax)
+@@ -157,6 +158,7 @@
+ #undef epoll_eperms
+ #undef epoll_eventmax
+ #undef epoll_events
++#undef epoll_exclusive
+ #undef evpipe
+ #undef fdchangecnt
+ #undef fdchangemax
+diff --git a/EV/EVAPI.h b/EV/EVAPI.h
+--- a/EV/EVAPI.h
++++ b/EV/EVAPI.h
+@@ -107,6 +107,10 @@ struct EVAPI {
+   void (*async_start)(EV_P_ ev_async *);
+   void (*async_stop) (EV_P_ ev_async *);
+   void (*async_send) (EV_P_ ev_async *);
++
++  /* EPOLLEXCLUSIVE support - Linux 4.5+ */
++  void (*set_epoll_exclusive)(EV_P_ int enable);
++  int  (*epoll_exclusive)(EV_P);
+ };
+
+ #if !EV_PROTOTYPES
+diff --git a/EV.xs b/EV.xs
+--- a/EV.xs
++++ b/EV.xs
+@@ -549,6 +549,10 @@ BOOT:
+     evapi.clear_pending        = ev_clear_pending;
+     evapi.invoke               = ev_invoke;
++#if EV_USE_EPOLL
++    evapi.set_epoll_exclusive  = ev_set_epoll_exclusive;
++    evapi.epoll_exclusive      = ev_epoll_exclusive;
++#endif
+
+     sv_setiv (sv, (IV)&evapi);
+     SvREADONLY_on (sv);
