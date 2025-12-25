@@ -5,7 +5,7 @@ use warnings;
 use EV ();
 use Carp ();
 
-our $VERSION = '1.505';
+our $VERSION = '1.506';
 
 require Feersum::Connection;
 require Feersum::Connection::Handle;
@@ -463,6 +463,28 @@ Override Feersum's notion of what SERVER_HOST and SERVER_PORT should be.
 =item C<< set_keepalive($bool) >>
 
 Override Feersum's default keepalive behavior.
+
+=item C<< read_priority() >>
+
+=item C<< read_priority($priority) >>
+
+Get or set the libev watcher priority for read I/O operations.
+Priority range is -2 (lowest) to +2 (highest), default is 0.
+Higher priority watchers are invoked before lower priority ones.
+
+=item C<< write_priority() >>
+
+=item C<< write_priority($priority) >>
+
+Get or set the libev watcher priority for write I/O operations.
+Priority range is -2 (lowest) to +2 (highest), default is 0.
+
+=item C<< accept_priority() >>
+
+=item C<< accept_priority($priority) >>
+
+Get or set the libev watcher priority for accept operations.
+Priority range is -2 (lowest) to +2 (highest), default is 0.
 
 =back
 

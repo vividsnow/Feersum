@@ -154,6 +154,21 @@ A reference to the writer is passed in as the first and only argument to the
 sub.  It's recommended that you use C<$_[0]> rather than closing-over on C<$w>
 to prevent a circular reference.
 
+=item C<< $w->sendfile($fh) >>
+
+Send file contents using zero-copy sendfile(2) system call. Linux only.
+The file handle should be a regular file opened for reading. The response
+should have a Content-Length header set to the file size. After calling
+sendfile(), call C<close()> on the writer.
+
+    my $w = $req->start_streaming(200, [
+        'Content-Type' => 'application/octet-stream',
+        'Content-Length' => -s $filename,
+    ]);
+    open my $fh, '<', $filename or die $!;
+    $w->sendfile($fh);
+    close $fh;
+
 =back
 
 =head2 Common methods.

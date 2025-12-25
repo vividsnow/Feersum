@@ -48,6 +48,18 @@ mode where N is the number of child processes.  The C<--preload-app> parameter
 that L<Starlet> supports isn't supported yet.  The fork is run immediately
 after startup and after the app is loaded (i.e. in the C<run()> method).
 
+A C<--reuseport> parameter can be specified to enable SO_REUSEPORT support
+for better multi-core scaling when combined with C<--pre-fork>. Requires
+Linux 3.9+ or similar kernel support.
+
+A C<--epoll-exclusive> parameter can be specified to enable EPOLLEXCLUSIVE
+for reducing thundering herd in pre-fork mode. Requires Linux 4.5+ and
+patched EV module. Useful with Server::Starter.
+
+Watcher priority options C<--read-priority>, C<--write-priority>, and
+C<--accept-priority> can be used to set libev I/O watcher priorities.
+Valid range is -2 (lowest) to +2 (highest), default is 0.
+
 =head1 METHODS
 
 =over 4
