@@ -1,5 +1,26 @@
 Revision history for Perl extension Feersum
 
+1.506 Mon Dec 29 00:00:00 2025 +0300
+        Performance:
+        - free-lists for iomatrix, feer_req and rinq structs
+        - cache remote_addr/remote_port per connection
+        - embed sockaddr_storage in feer_conn struct
+        - cached SVs for common HTTP status codes
+        - ASCII case conversion lookup tables
+        - improved likely/unlikely branch hints
+
+        Features:
+        - sendfile() zero-copy file transfer (Linux)
+        - SO_REUSEPORT for better prefork scaling
+        - EPOLLEXCLUSIVE for prefork thundering herd mitigation (no libev patching needed)
+        - configurable libev watcher priorities (read_priority, write_priority, accept_priority)
+
+        Code quality:
+        - added OOM check in rinq allocation with croak()
+
+        Bugfixes:
+        - fix chunked encoding for streaming responses with Content-Length
+
 1.505 Wed Apr 09 16:20:00 2025 -0200
         - pipeline fix
         - minor: manifest fix and test tweaks
