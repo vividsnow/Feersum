@@ -18,10 +18,18 @@ if ($native) {
     my $listen = 'localhost:5000';
     my $pre_fork = 0;
     my $verbose = 0;
+    my $reuseport = 0;
+    my $epoll_exclusive = 0;
+    my ($read_priority, $write_priority, $accept_priority);
     Getopt::Long::GetOptions(
         "listen=s" => \$listen,
         "pre-fork=i" => \$pre_fork,
         "verbose!" => \$verbose,
+        "reuseport!" => \$reuseport,
+        "epoll-exclusive!" => \$epoll_exclusive,
+        "read-priority=i" => \$read_priority,
+        "write-priority=i" => \$write_priority,
+        "accept-priority=i" => \$accept_priority,
     );
     require Feersum::Runner;
     my $app_file = pop @ARGV || 'app.feersum';
@@ -30,6 +38,11 @@ if ($native) {
         app_file => $app_file,
         pre_fork => $pre_fork,
         quiet => !$verbose,
+        reuseport => $reuseport,
+        epoll_exclusive => $epoll_exclusive,
+        (defined $read_priority ? (read_priority => $read_priority) : ()),
+        (defined $write_priority ? (write_priority => $write_priority) : ()),
+        (defined $accept_priority ? (accept_priority => $accept_priority) : ()),
     );
 }
 else {

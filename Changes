@@ -1,5 +1,50 @@
 Revision history for Perl extension Feersum
 
+1.507 Sun Jan 11 00:00:00 2026 +0300
+        Features:
+        - Expect: 100-continue support for HTTP/1.1 clients
+        - Transfer-Encoding: chunked request body support
+
+        Bugfixes:
+        - fix uninitialized pointer in feersum_env_headers (potential UB)
+        - fix off-by-one in uri_decode_sv bounds check
+        - fix fcntl calls to preserve existing file descriptor flags
+        - fix RESPOND_SHUTDOWN debug string value
+        - fix av_extend argument for psgi.version array
+        - fix max_connection_reqs type handling for negative values
+
+        Code quality:
+        - remove unused forward declaration feersum_set_keepalive
+        - remove unused crlf_sv variable
+        - remove unused char* n in feersum_env_headers
+        - remove redundant conditional in keepalive reset
+        - add missing static keyword to ev_idle ei declaration
+        - add default case to switch in feersum_env_headers
+        - use STRLEN instead of int for buffer sizes
+        - improve multiline header tracking variable naming
+        - fix typos: theif -> thief, probaby -> probably
+
+1.506 Mon Dec 29 00:00:00 2025 +0300
+        Performance:
+        - free-lists for iomatrix, feer_req and rinq structs
+        - cache remote_addr/remote_port per connection
+        - embed sockaddr_storage in feer_conn struct
+        - cached SVs for common HTTP status codes
+        - ASCII case conversion lookup tables
+        - improved likely/unlikely branch hints
+
+        Features:
+        - sendfile() zero-copy file transfer (Linux)
+        - SO_REUSEPORT for better prefork scaling
+        - EPOLLEXCLUSIVE for prefork thundering herd mitigation (no libev patching needed)
+        - configurable libev watcher priorities (read_priority, write_priority, accept_priority)
+
+        Code quality:
+        - added OOM check in rinq allocation with croak()
+
+        Bugfixes:
+        - fix chunked encoding for streaming responses with Content-Length
+
 1.505 Wed Apr 09 16:20:00 2025 -0200
         - pipeline fix
         - minor: manifest fix and test tweaks
