@@ -167,7 +167,7 @@ sub {
     is $headers->{Status}, 400, 'client 4 Bad Request';
     is $headers->{Reason}, "Bad Request";
     is $headers->{'content-type'}, 'text/plain';
-    is $body, "Malformed request.\n", 'client 4 expected error';
+    is $body, "Malformed request\n", 'client 4 expected error';
     $cv->end;
 };
 

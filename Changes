@@ -1,5 +1,75 @@
 Revision history for Perl extension Feersum
 
+1.506 Thu Jan 16 00:00:00 2026 +0300
+        Performance:
+        - free-lists for iomatrix, feer_req and rinq structs
+        - cache remote_addr/remote_port per connection
+        - embed sockaddr_storage in feer_conn struct
+        - cached SVs for common HTTP status codes
+        - ASCII case conversion lookup tables
+        - improved likely/unlikely branch hints
+
+        Benchmarks (vs 1.505, keepalive mode, h2load -c100 -t2 -D10s):
+        - TCP PSGI: 139K req/s (+42% vs 98K in 1.505)
+        - TCP Native: 219K req/s (+61% vs 135K in 1.505)
+        - Unix socket PSGI: 184K req/s (+32% vs TCP)
+        - Unix socket Native: 352K req/s (+61% vs TCP)
+
+        Features:
+        - Expect: 100-continue support for HTTP/1.1 clients
+        - Transfer-Encoding: chunked request body support
+        - Native interface io() method for protocol upgrades (WebSocket, etc.)
+        - Native interface return_from_io() for keepalive after io() access
+        - PSGI return_from_psgix_io() for keepalive after psgix.io access
+        - poll_cb support on Reader handles for streaming input
+        - pause_accept/resume_accept methods for backpressure control
+        - sendfile() zero-copy file transfer (Linux)
+        - SO_REUSEPORT for better prefork scaling
+        - EPOLLEXCLUSIVE for prefork thundering herd mitigation (no libev patching needed)
+        - configurable libev watcher priorities (read_priority, write_priority, accept_priority)
+
+        Security:
+        - Request smuggling prevention: reject requests with both
+          Content-Length and Transfer-Encoding headers (RFC 7230)
+        - Reject obsolete header line folding (obs-fold) per RFC 7230
+        - DoS protection: MAX_TRAILER_HEADERS limit for chunked requests
+
+        Bugfixes:
+        - fix uninitialized pointer in feersum_env_headers (potential UB)
+        - fix off-by-one in uri_decode_sv bounds check
+        - fix fcntl calls to preserve existing file descriptor flags
+        - fix RESPOND_SHUTDOWN debug string value
+        - fix av_extend argument for psgi.version array
+        - fix max_connection_reqs type handling for negative values
+        - fix test files missing 'use blib' (t/17-priority.t, t/56-leak-extended.t)
+        - fix error message consistency (remove trailing periods)
+        - fix chunked encoding for streaming responses with Content-Length
+        - fix io_taken flag reset in return_from_psgix_io for keepalive
+        - fix missing HEADER_NORM_UPCASE_DASH in @EXPORT_OK
+
+        Code quality:
+        - add thread-safety documentation and comments to non-thread-safe structures
+        - add unlikely() to error paths consistently
+        - add trailer_count field to connection struct for chunked parsing state
+        - improve assert messages with descriptions
+        - remove dead code: unused str_eq function, obs-fold handlers,
+          RINQ_IS_UNINIT and RINQ_IS_ATTACHED macros
+        - remove unused forward declaration feersum_set_keepalive
+        - remove unused crlf_sv variable
+        - remove unused char* n in feersum_env_headers
+        - remove redundant conditional in keepalive reset
+        - add missing static keyword to ev_idle ei declaration
+        - add default case to switch in feersum_env_headers
+        - use STRLEN instead of int for buffer sizes
+        - improve multiline header tracking variable naming
+        - fix typos: theif -> thief, probaby -> probably
+        - added OOM check in rinq allocation with croak()
+        - update outdated documentation for poll_cb on Reader handles
+        - update outdated documentation for keepalive support
+        - refactor: extract send_100_continue() helper to deduplicate code
+        - refactor: extract free_request() helper to deduplicate request cleanup
+        - refactor: extract feersum_return_from_io() shared helper for io return
+
 1.505 Wed Apr 09 16:20:00 2025 -0200
         - pipeline fix
         - minor: manifest fix and test tweaks

@@ -4,7 +4,7 @@ use strict;
 use Carp qw/croak/;
 
 sub new {
-    Carp::croak "Cannot instantiate Feersum::Connection::Handles directly";
+    Carp::croak "Cannot instantiate Feersum::Connection::Handle directly";
 }
 
 package Feersum::Connection::Reader;
@@ -108,7 +108,9 @@ Discards the remainder of the input buffer.
 
 =item C<< $r->poll_cb(sub { .... }) >>
 
-B<NOT YET SUPPORTED>.  PSGI only defined poll_cb for the Writer object.
+Register a callback to be called when more request body data is available.
+The callback receives the Reader object as its argument. Useful for streaming
+request body reads with Expect: 100-continue.
 
 =back
 
@@ -153,6 +155,21 @@ C<undef> to unset.  The sub can call C<close()>.
 A reference to the writer is passed in as the first and only argument to the
 sub.  It's recommended that you use C<$_[0]> rather than closing-over on C<$w>
 to prevent a circular reference.
+
+=item C<< $w->sendfile($fh) >>
+
+Send file contents using zero-copy sendfile(2) system call. Linux only.
+The file handle should be a regular file opened for reading. The response
+should have a Content-Length header set to the file size. After calling
+sendfile(), call C<close()> on the writer.
+
+    my $w = $req->start_streaming(200, [
+        'Content-Type' => 'application/octet-stream',
+        'Content-Length' => -s $filename,
+    ]);
+    open my $fh, '<', $filename or die $!;
+    $w->sendfile($fh);
+    close $fh;
 
 =back
 

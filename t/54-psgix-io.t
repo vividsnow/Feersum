@@ -118,6 +118,7 @@ for my $round (1..ROUNDS) {
         });
 
         $h->push_write("GET / HTTP/1.1$CRLF".
+            "Host: localhost$CRLF".
             "Upgrade: chatz$CRLF".
             "X-Client: $n$CRLF".
             $CRLF.
