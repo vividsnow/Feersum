@@ -18,10 +18,18 @@ if ($native) {
     my $listen = 'localhost:5000';
     my $pre_fork = 0;
     my $verbose = 0;
+    my $reuseport = 0;
+    my $epoll_exclusive = 0;
+    my ($read_priority, $write_priority, $accept_priority);
     Getopt::Long::GetOptions(
         "listen=s" => \$listen,
         "pre-fork=i" => \$pre_fork,
         "verbose!" => \$verbose,
+        "reuseport!" => \$reuseport,
+        "epoll-exclusive!" => \$epoll_exclusive,
+        "read-priority=i" => \$read_priority,
+        "write-priority=i" => \$write_priority,
+        "accept-priority=i" => \$accept_priority,
     );
     require Feersum::Runner;
     my $app_file = pop @ARGV || 'app.feersum';
@@ -30,6 +38,11 @@ if ($native) {
         app_file => $app_file,
         pre_fork => $pre_fork,
         quiet => !$verbose,
+        reuseport => $reuseport,
+        epoll_exclusive => $epoll_exclusive,
+        (defined $read_priority ? (read_priority => $read_priority) : ()),
+        (defined $write_priority ? (write_priority => $write_priority) : ()),
+        (defined $accept_priority ? (accept_priority => $accept_priority) : ()),
     );
 }
 else {
@@ -65,9 +78,45 @@ Loads the specified app file into a Feersum server.
 In both cases, if C<--pre-fork=N> is specified, that many worker processes are
 used to serve requests. See L<Feersum::Runner> for details.
 
-If in native mode (when running C<feersum --native>), currently only a
-C<--listen> parameter is accepted.  By default, the server will listen on
-localhost port 5000.
+If in native mode (when running C<feersum --native>), the following options
+are available:
+
+=over 4
+
+=item C<--listen host:port>
+
+Address to listen on. Default is localhost:5000. IPv6 addresses should use
+bracket notation: C<--listen [::1]:5000>
+
+=item C<--pre-fork=N>
+
+Fork N worker processes to handle requests.
+
+=item C<--verbose>
+
+Enable verbose output.
+
+=item C<--reuseport>
+
+Enable SO_REUSEPORT for better load distribution across workers.
+
+=item C<--epoll-exclusive>
+
+Enable EPOLLEXCLUSIVE mode (Linux 4.5+) for exclusive wakeup of workers.
+
+=item C<--read-priority=N>
+
+Set EV priority for read events (-2 to 2).
+
+=item C<--write-priority=N>
+
+Set EV priority for write events (-2 to 2).
+
+=item C<--accept-priority=N>
+
+Set EV priority for accept events (-2 to 2).
+
+=back
 
 When running in PSGI mode (non-native), L<Plack::Runner> is used.  See that
 module for documentation and defaults.

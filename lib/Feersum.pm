@@ -5,7 +5,7 @@ use warnings;
 use EV ();
 use Carp ();
 
-our $VERSION = '1.505';
+our $VERSION = '1.506';
 
 require Feersum::Connection;
 require Feersum::Connection::Handle;
@@ -19,13 +19,13 @@ $VERSION = eval $VERSION; ## no critic (StringyEval, ConstantVersion)
 our $INSTANCE;
 
 use Exporter 'import';
-our @EXPORT_OK = qw(HEADER_NORM_UPCASE HEADER_NORM_LOCASE HEADER_NORM_LOCASE_DASH);
+our @EXPORT_OK = qw(HEADER_NORM_UPCASE HEADER_NORM_LOCASE HEADER_NORM_UPCASE_DASH HEADER_NORM_LOCASE_DASH);
 
 sub new {
     unless ($INSTANCE) {
         $INSTANCE = bless {}, __PACKAGE__;
+        $SIG{PIPE} = 'IGNORE';
     }
-    $SIG{PIPE} = 'IGNORE';
     return $INSTANCE;
 }
 *endjinn = *new;
@@ -82,10 +82,9 @@ Feersum - A PSGI engine for Perl based on EV/libev
 
 =head1 DESCRIPTION
 
-Feersum is an HTTP server built on L<EV>.  It fully supports the PSGI 1.03
+Feersum is an HTTP server built on L<EV>.  It fully supports the PSGI 1.1
 spec including the C<psgi.streaming> interface and is compatible with Plack.
-PSGI 1.1, which has yet to be published formally, is also supported.  Feersum
-also has its own "native" interface which is similar in a lot of ways to PSGI,
+It also has its own "native" interface which is similar in a lot of ways to PSGI,
 but is B<not compatible> with PSGI or PSGI middleware.
 
 Feersum uses a single-threaded, event-based programming architecture to scale
@@ -146,7 +145,7 @@ reflect this).
 
 =head2 PSGI interface
 
-Feersum fully supports the PSGI 1.03 spec including C<psgi.streaming>.
+Feersum fully supports the PSGI 1.1 spec including C<psgi.streaming>.
 
 See also L<Plack::Handler::Feersum>, which provides a way to use Feersum with
 L<plackup> and L<Plack::Runner>.
@@ -159,7 +158,7 @@ Call C<< psgi_request_handler($app) >> to register C<$app> as a PSGI handler.
 The env hash passed in will always have the following keys in addition to
 dynamic ones:
 
-    psgi.version      => [1,0],
+    psgi.version      => [1,1],
     psgi.nonblocking  => 1,
     psgi.multithread  => '', # i.e. false
     psgi.multiprocess => '',
@@ -188,8 +187,7 @@ no body to avoid unnecessary work.
     $r->close();
 
 The C<psgi.streaming> interface is fully supported, including the
-writer-object C<poll_cb> callback feature defined in PSGI 1.03.  B<Note that
-poll_cb is removed from the preliminary PSGI 1.1 spec>.  Feersum calls the
+writer-object C<poll_cb> callback feature.  Feersum calls the
 poll_cb callback after all data has been flushed out and the socket is
 write-ready.  The data is buffered until the callback returns at which point
 it will be immediately flushed to the socket.
@@ -272,7 +270,8 @@ the streaming callback B<MUST NOT> be called for the same reason.
     my $env = shift;
     return sub {
         my $fh = $env->{'psgix.io'};
-        syswrite $fh,
+        syswrite $fh, "HTTP/1.1 200 OK\r\n\r\nHello from raw socket";
+        close $fh;
     };
 
 =back
@@ -336,7 +335,7 @@ acts more like a buffered 'print').  Calls to C<write()> will never block.
     $w->write("regular scalars are OK too\n");
     $w->close(); # close off the stream
 
-The writer object supports C<poll_cb> as also specified in PSGI 1.03.  Feersum
+The writer object supports C<poll_cb> as specified in PSGI.  Feersum
 will call the callback only when all data has been flushed out at the socket
 level.  Use C<close()> or unset the handler (C<< $w->poll_cb(undef) >>) to
 stop the callback from getting called.
@@ -386,6 +385,23 @@ to C<use_socket>.
 
 Stop listening to the socket specified by use_socket or accept_on_fd.
 
+=item C<< pause_accept() >>
+
+Temporarily stop accepting new connections.  Existing connections continue
+to be processed.  Returns true if paused successfully, false if already
+paused or during shutdown.
+
+Useful for load shedding or controlled traffic management.
+
+=item C<< resume_accept() >>
+
+Resume accepting new connections after a pause_accept() call.  Returns true
+if resumed successfully, false if not paused or during shutdown.
+
+=item C<< accept_is_paused() >>
+
+Returns true if accepting is currently paused, false otherwise.
+
 =item C<< request_handler(sub { my $req = shift; ... }) >>
 
 Sets the global request handler.  Any previous handler is replaced.
@@ -409,7 +425,7 @@ Like request_handler, but assigns a PSGI handler instead.
 Get or set the global read timeout.
 
 Feersum will wait about this long to receive all headers of a request (within
-the tollerances provided by libev).  If an entity body is part of the request
+the tolerances provided by libev).  If an entity body is part of the request
 (e.g. POST or PUT) it will wait this long between successful C<read()> system
 calls.
 
@@ -463,6 +479,92 @@ Override Feersum's notion of what SERVER_HOST and SERVER_PORT should be.
 =item C<< set_keepalive($bool) >>
 
 Override Feersum's default keepalive behavior.
+
+=item C<< max_connection_reqs() >>
+
+=item C<< max_connection_reqs($count) >>
+
+Get or set the maximum number of requests allowed per keep-alive connection.
+Default is 0 (unlimited). When set to a positive value, the connection will
+be closed after serving that many requests, even if keep-alive is enabled.
+
+This is useful for preventing any single connection from monopolizing server
+resources and helps with memory management by periodically recycling
+connections.
+
+=item C<< read_priority() >>
+
+=item C<< read_priority($priority) >>
+
+Get or set the libev watcher priority for read I/O operations.
+Priority range is -2 (lowest) to +2 (highest), default is 0.
+Higher priority watchers are invoked before lower priority ones.
+
+=item C<< write_priority() >>
+
+=item C<< write_priority($priority) >>
+
+Get or set the libev watcher priority for write I/O operations.
+Priority range is -2 (lowest) to +2 (highest), default is 0.
+
+=item C<< accept_priority() >>
+
+=item C<< accept_priority($priority) >>
+
+Get or set the libev watcher priority for accept operations.
+Priority range is -2 (lowest) to +2 (highest), default is 0.
+
+=item C<< set_epoll_exclusive($bool) >>
+
+Enable or disable the use of EPOLLEXCLUSIVE flag when accepting connections.
+This is a Linux-specific optimization that prevents the "thundering herd"
+problem when multiple worker processes are accepting on the same socket.
+
+When enabled, the kernel will wake only one process when a new connection
+arrives, rather than waking all waiting processes.
+
+Only effective on Linux systems; has no effect on other platforms.
+
+=item C<< get_epoll_exclusive() >>
+
+Returns true if EPOLLEXCLUSIVE mode is enabled, false otherwise.
+
+=item C<< max_accept_per_loop() >>
+
+=item C<< max_accept_per_loop($count) >>
+
+Get or set the maximum number of connections to accept per event loop
+iteration. Default is 64.
+
+Limiting accepts per loop prevents a flood of new connections from starving
+existing connections of CPU time. Lower values provide more fairness between
+new and existing connections; higher values improve throughput under heavy
+connection load.
+
+=item C<< active_conns() >>
+
+Returns the current count of active connections being handled by Feersum.
+Useful for monitoring, load shedding decisions, or graceful shutdown logic.
+
+=item C<< total_requests() >>
+
+Returns the total number of requests processed since the server started.
+Useful for monitoring and statistics. The counter is a 64-bit unsigned integer.
+
+=item C<< max_connections() >>
+
+=item C<< max_connections($limit) >>
+
+Get or set the maximum number of concurrent connections. Default is 0
+(unlimited).
+
+When the limit is reached, new connections are immediately closed after
+accept(). This provides protection against Slowloris-style DoS attacks that
+attempt to exhaust server resources by holding many connections open.
+
+Setting this to 0 disables the limit. In production, consider also running
+Feersum behind a reverse proxy (nginx, HAProxy) which can provide additional
+connection limiting and rate limiting.
 
 =back
 
@@ -579,6 +681,12 @@ Feersum will have set SIGPIPE to be ignored by the time your handler gets
 called.  If your handler needs to detect SIGPIPE, be sure to do a
 C<local $SIG{PIPE} = ...> (L<perlipc>) to make it active just during the
 necessary scope.
+
+Feersum is B<not thread-safe> and must not be used with Perl ithreads.
+It uses global/static data structures (free lists, lookup tables) that are
+not protected by locks.  Running Feersum in a multi-threaded environment
+will cause race conditions and memory corruption.  Use pre-fork instead of
+threads for parallelism.
 
 =head1 SEE ALSO
 

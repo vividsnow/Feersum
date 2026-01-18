@@ -36,7 +36,7 @@ my $w = simple_client GET => "/?blar", timeout => 3, sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 500, "client got 500";
     is $headers->{'content-type'}, 'text/plain';
-    is $body, "Request handler exception.\n", 'got expected body';
+    is $body, "Request handler exception\n", 'got expected body';
     $cv->end;
 };
 
