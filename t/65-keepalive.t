@@ -76,10 +76,10 @@ if ($pid == 0) { # child
         },
         timeout => 2
     );
-    $hdl->push_write("GET / HTTP/1.1\015\012\015\012");
+    $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012");
     $hdl->push_read(line => "\015\012\015\012" => sub {
         unlike $_[1], qr(Connection), 'http/1.1 no connection header';
-        $hdl->push_write("GET / HTTP/1.1\015\012Connection: close\015\012\015\012");
+        $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012Connection: close\015\012\015\012");
         $hdl->push_read(line => "\015\012\015\012" => sub {
             like $_[1], qr(Connection: close), 'http/1.1 connection close reply';
             $hdl->on_read(sub {});
@@ -113,11 +113,11 @@ if ($pid == 0) { # child
         timeout => 2
     );
     my $w;
-    $hdl->push_write("GET / HTTP/1.1\015\012\015\012");
+    $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012");
     $hdl->push_read(line => "\015\012\015\012" => sub {
         unlike $_[1], qr(Connection), 'http/1.1 no connection header';
         $hdl->on_read(sub {});
-        $w = AE::timer 1.1, 0, sub { $hdl->push_write("GET / HTTP/1.1\015\012\015\012") };
+        $w = AE::timer 1.1, 0, sub { $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012") };
     });
     $cv->recv;
     undef $hdl;
@@ -187,7 +187,7 @@ if ($pid == 0) { # child
 
     $send_request = sub {
         $request_count++;
-        $hdl->push_write("GET / HTTP/1.1\015\012\015\012");
+        $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012");
         $hdl->push_read(line => "\015\012\015\012" => sub {
             if ($request_count < 4) {
                 unlike $_[1], qr(Connection: close), "request $request_count: no close header";

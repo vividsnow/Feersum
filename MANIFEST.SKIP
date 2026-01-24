@@ -9,7 +9,7 @@ gprof
 Feersum\.(?:o|bs|c)$
 Feersum-.+\.tar(?:\.gz)?
 ^http_load
-\.patch$
+^[^/]*\.patch$
 Makefile$
 Makefile\.old$
 pm_to_blib

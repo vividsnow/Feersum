@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{FEERSUM_TEST_TIMEOUT_MULT} || 1;
 use constant HARDER => $ENV{RELEASE_TESTING} ? 1 : 0;
 use constant NUM_FORK => HARDER ? 4 : 2;
 use constant CLIENTS => HARDER ? 30 : 4;
@@ -21,6 +23,7 @@ sub simple_get {
     $cv->begin;
     my $cli; $cli = simple_client GET => "/?q=$n",
         name => "client $n",
+        timeout => 30 * TIMEOUT_MULT,
         sub {
             my ($body,$headers) = @_;
             is($headers->{Status}, 200, "client $n: http success") or diag($headers->{Reason});
@@ -48,7 +51,8 @@ if (!$pid) {
     POSIX::exit(0);
 }
 
-select undef, undef, undef, 0.25; # sleep a bit to give the server time to start
+# Wait for server to start - longer on slow machines
+select undef, undef, undef, 0.5 * TIMEOUT_MULT;
 
 $cv = AE::cv;
 simple_get($port, $_) for (1..CLIENTS);

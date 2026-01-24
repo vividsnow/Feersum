@@ -1,5 +1,23 @@
 Revision history for Perl extension Feersum
 
+1.507 Sat Jan 25 00:00:00 2026 +0300
+        - optimize psgi env hash creation: direct build
+        - header_timeout for slowloris attack protection
+        - max_connections limit for connection-based dos protection
+        - pause_accept/resume_accept for traffic control
+        - active_conns() and total_requests() for monitoring
+        - native io() and return_from_io() for protocol upgrades
+        - query() method for direct query string access
+        - ipv6 support with bracket notation parsing
+        - libev priority controls (read/write/accept_priority)
+        - epollexclusive support for linux prefork scaling
+        - max_accept_per_loop to prevent accept starvation
+        - expect: 100-continue support for http/1.1 clients
+        - transfer-encoding: chunked request body support
+        - poll_cb support on reader handles for streaming input
+        - sendfile() zero-copy file transfer (linux)
+        - so_reuseport for better prefork scaling
+
 1.505 Wed Apr 09 16:20:00 2025 -0200
         - pipeline fix
         - minor: manifest fix and test tweaks

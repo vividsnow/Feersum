@@ -35,8 +35,6 @@ $cb = sub {
     pass "called back!";
     my $r = shift;
     isa_ok $r, 'Feersum::Connection', 'got an object!';
-#     use Devel::Peek();
-#     Devel::Peek::Dump($r);
     my $env = $r->env();
     ok $env, "got env";
     is $env->{HTTP_USER_AGENT}, 'FeersumSimpleClient/1.0', 'got a ua!';

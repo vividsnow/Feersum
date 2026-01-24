@@ -1,12 +1,10 @@
 package Utils;
 use strict;
-use base 'Exporter';
 use Test::More ();
 use Socket qw/SOMAXCONN/;
 use IO::Socket::INET;
-use bytes; no bytes;
 use blib;
-use Carp qw(carp cluck confess croak);
+use Carp qw(carp croak);
 use Encode ();
 use AnyEvent ();
 use AnyEvent::Handle ();
@@ -22,8 +20,6 @@ sub import {
     my ($pkg) = caller;
     no strict 'refs';
     *{$pkg.'::carp'} = \&Carp::carp;
-    *{$pkg.'::cluck'} = \&Carp::cluck;
-    *{$pkg.'::confess'} = \&Carp::confess;
     *{$pkg.'::croak'} = \&Carp::croak;
     *{$pkg.'::guard'} = \&Guard::guard;
     *{$pkg.'::scope_guard'} = \&Guard::scope_guard;
@@ -116,7 +112,6 @@ sub simple_client ($$;@) {
                 my ($k,$v) = split(/:\s+/,$_);
                 (lc($k),$v);
             } @hdrs;
-            # $hdrs{OrigHead} = $head;
             if ($status_line =~ m{HTTP/(1.\d) (\d{3}) +(.+)\s*}) {
                 $hdrs{HTTPVersion} = $1;
                 $hdrs{Status} = $2;
@@ -135,14 +130,12 @@ sub simple_client ($$;@) {
         }
         elsif (exists $hdrs{'content-length'}) {
             return $done->() unless ($hdrs{'content-length'});
-#             Test::More::diag "$name waiting for C-L body";
             $h->push_read(chunk => $hdrs{'content-length'}, sub {
                 $buf = $_[1];
                 return $done->();
             });
         }
         elsif (($hdrs{'transfer-encoding'}||'') eq 'chunked') {
-#             Test::More::diag "$name waiting for T-E:chunked body";
             my $len = 0;
             my ($chunk_reader, $chunk_handler);
             $chunk_handler = sub {
@@ -174,7 +167,6 @@ sub simple_client ($$;@) {
         elsif ($hdrs{HTTPVersion} eq '1.0' or
                ($hdrs{connection}||'') eq 'close')
         {
-#             Test::More::diag "$name waiting for conn:close body";
             $h->on_read(sub {
                 $buf .= substr($_[0]->{rbuf},0,length($_[0]->{rbuf}),'');
             });
@@ -210,9 +202,6 @@ sub simple_client ($$;@) {
     $strong_h->push_write($head.$CRLF.$CRLF.$body)
         unless $opts{skip_head};
 
-#     $http_req =~ s/$CRLF/<CRLF>\n/sg;
-#     Test::More::diag($http_req);
-    
     return $strong_h;
 }
 

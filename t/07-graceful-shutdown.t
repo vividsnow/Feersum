@@ -80,6 +80,8 @@ sub client {
 
 client($_) for (1..CLIENTS);
 
+my $shutdown_done = 0;
+
 $cv->begin;
 my $death;
 my $grace_t = AE::timer 1.0, 0, sub {
@@ -91,6 +93,7 @@ my $grace_t = AE::timer 1.0, 0, sub {
     $evh->graceful_shutdown(sub {
         pass "all gracefully shut down, supposedly";
         undef $death;
+        $shutdown_done = 1;
         $cv->end;
     });
 };
@@ -98,9 +101,9 @@ my $grace_t = AE::timer 1.0, 0, sub {
 $cv->begin;
 my $try_connect = AE::timer 3.5, 0, sub {
     my $h; $h = AnyEvent::Handle->new(
-        connect => ["localhost", $port],
+        connect => ['127.0.0.1', $port],  # use IPv4 explicitly to match listen socket
         on_connect => sub {
-            fail "boo, connected when shut down";
+            fail "boo, connected when shut down (shutdown_done=$shutdown_done)";
             $cv->end;
             undef $h;
         },

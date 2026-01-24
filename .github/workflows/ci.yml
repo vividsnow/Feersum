@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl-version:
+          - '5.16'
+          - '5.18'
+          - '5.20'
+          - '5.22'
+          - '5.24'
+          - '5.26'
+          - '5.28'
+          - '5.30'
+          - '5.32'
+          - '5.34'
+          - '5.36'
+          - '5.38'
+          - '5.40'
+          - '5.42'
+
+    container:
+      image: perldocker/perl-tester:${{ matrix.perl-version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: perl -V
+        run: perl -V
+
+      - name: Install EV::MakeMaker
+        run: cpanm -n EV::MakeMaker
+
+      - name: perl Makefile.PL
+        run: perl Makefile.PL
+
+      - name: Install dependencies
+        run: cpanm -n --installdeps .
+
+      - name: make
+        run: make
+
+      - name: make test
+        run: make test
+
+  macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        perl-version:
+          - '5.26'
+          - '5.30'
+          - '5.34'
+          - '5.38'
+          - '5.40'
+          - '5.42'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl-version }}
+
+      - name: perl -V
+        run: perl -V
+
+      - name: Install EV::MakeMaker
+        run: cpanm -n EV::MakeMaker
+
+      - name: perl Makefile.PL
+        run: perl Makefile.PL
+
+      - name: Install dependencies
+        run: cpanm -n --installdeps .
+
+      - name: make
+        run: make
+
+      - name: make test
+        run: make test
+
+  freebsd:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y perl5 p5-EV p5-AnyEvent p5-Plack p5-Guard p5-Test-Fatal p5-Test-LeakTrace p5-JSON-XS p5-HTTP-Entity-Parser p5-Test-TCP p5-HTML-Parser
+          run: |
+            perl -V
+            perl Makefile.PL
+            make
+            make test

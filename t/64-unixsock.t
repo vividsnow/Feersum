@@ -65,7 +65,7 @@ if ($pid == 0) { # child
         },
         timeout => 5
     );
-    $hdl->push_write("GET / HTTP/1.1\015\012\015\012");
+    $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012");
     $hdl->push_read(line => sub {
         is $_[1], 'HTTP/1.1 200 OK', 'got reply';
         $cv->send;
