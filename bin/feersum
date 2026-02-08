@@ -18,11 +18,65 @@ if ($native) {
     my $listen = 'localhost:5000';
     my $pre_fork = 0;
     my $verbose = 0;
+    my $reuseport = 0;
+    my $epoll_exclusive = 0;
+    my ($read_priority, $write_priority, $accept_priority);
+    my ($keepalive, $read_timeout, $header_timeout, $max_connection_reqs, $max_accept_per_loop, $max_connections);
+    my $reverse_proxy = 0;
+    my ($proxy_protocol, $tls_cert_file, $tls_key_file, $h2);
     Getopt::Long::GetOptions(
         "listen=s" => \$listen,
         "pre-fork=i" => \$pre_fork,
         "verbose!" => \$verbose,
+        "reuseport!" => \$reuseport,
+        "epoll-exclusive!" => \$epoll_exclusive,
+        "reverse-proxy!" => \$reverse_proxy,
+        "proxy-protocol!" => \$proxy_protocol,
+        "tls-cert-file=s" => \$tls_cert_file,
+        "tls-key-file=s"  => \$tls_key_file,
+        "h2!" => \$h2,
+        "read-priority=i" => \$read_priority,
+        "write-priority=i" => \$write_priority,
+        "accept-priority=i" => \$accept_priority,
+        "keepalive!" => \$keepalive,
+        "read-timeout=f" => \$read_timeout,
+        "header-timeout=f" => \$header_timeout,
+        "max-connection-reqs=i" => \$max_connection_reqs,
+        "max-accept-per-loop=i" => \$max_accept_per_loop,
+        "max-connections=i" => \$max_connections,
     );
+    # Validate priority values (-2 to +2 per libev)
+    for my $prio ([$read_priority, 'read'], [$write_priority, 'write'], [$accept_priority, 'accept']) {
+        if (defined $prio->[0] && ($prio->[0] < -2 || $prio->[0] > 2)) {
+            die "Error: --$prio->[1]-priority must be between -2 and 2\n";
+        }
+    }
+    # Validate numeric parameters
+    if (defined $read_timeout && $read_timeout <= 0) {
+        die "Error: --read-timeout must be positive (non-zero)\n";
+    }
+    if (defined $header_timeout && $header_timeout < 0) {
+        die "Error: --header-timeout must be non-negative\n";
+    }
+    if (defined $max_connection_reqs && ($max_connection_reqs < 0 || $max_connection_reqs != int($max_connection_reqs))) {
+        die "Error: --max-connection-reqs must be a non-negative integer\n";
+    }
+    if (defined $max_accept_per_loop && ($max_accept_per_loop < 1 || $max_accept_per_loop != int($max_accept_per_loop))) {
+        die "Error: --max-accept-per-loop must be a positive integer\n";
+    }
+    if (defined $max_connections && ($max_connections < 0 || $max_connections != int($max_connections))) {
+        die "Error: --max-connections must be a non-negative integer\n";
+    }
+    # Validate TLS/H2 flag combinations
+    if ($tls_cert_file && !$tls_key_file) {
+        die "Error: --tls-cert-file requires --tls-key-file\n";
+    }
+    if ($tls_key_file && !$tls_cert_file) {
+        die "Error: --tls-key-file requires --tls-cert-file\n";
+    }
+    if ($h2 && !$tls_cert_file) {
+        die "Error: --h2 requires TLS (--tls-cert-file and --tls-key-file)\n";
+    }
     require Feersum::Runner;
     my $app_file = pop @ARGV || 'app.feersum';
     $runner = Feersum::Runner->new(
@@ -30,6 +84,21 @@ if ($native) {
         app_file => $app_file,
         pre_fork => $pre_fork,
         quiet => !$verbose,
+        reuseport => $reuseport,
+        epoll_exclusive => $epoll_exclusive,
+        (defined $read_priority ? (read_priority => $read_priority) : ()),
+        (defined $write_priority ? (write_priority => $write_priority) : ()),
+        (defined $accept_priority ? (accept_priority => $accept_priority) : ()),
+        (defined $keepalive ? (keepalive => $keepalive) : ()),
+        (defined $read_timeout ? (read_timeout => $read_timeout) : ()),
+        (defined $max_connection_reqs ? (max_connection_reqs => $max_connection_reqs) : ()),
+        (defined $max_accept_per_loop ? (max_accept_per_loop => $max_accept_per_loop) : ()),
+        (defined $max_connections ? (max_connections => $max_connections) : ()),
+        (defined $header_timeout ? (header_timeout => $header_timeout) : ()),
+        ($reverse_proxy ? (reverse_proxy => $reverse_proxy) : ()),
+        ($proxy_protocol ? (proxy_protocol => 1) : ()),
+        ($tls_cert_file ? (tls => { cert_file => $tls_cert_file, key_file => $tls_key_file }) : ()),
+        ($h2 ? (h2 => 1) : ()),
     );
 }
 else {
@@ -65,9 +134,98 @@ Loads the specified app file into a Feersum server.
 In both cases, if C<--pre-fork=N> is specified, that many worker processes are
 used to serve requests. See L<Feersum::Runner> for details.
 
-If in native mode (when running C<feersum --native>), currently only a
-C<--listen> parameter is accepted.  By default, the server will listen on
-localhost port 5000.
+If in native mode (when running C<feersum --native>), the following options
+are available:
+
+=over 4
+
+=item C<--listen host:port>
+
+Address to listen on. Default is localhost:5000. IPv6 addresses should use
+bracket notation: C<--listen [::1]:5000>.  B<Note:> IPv6 requires
+C<--reuseport> mode; see L<Feersum::Runner> for details.
+
+=item C<--pre-fork=N>
+
+Fork N worker processes to handle requests.
+
+=item C<--verbose>
+
+Enable verbose output.
+
+=item C<--reuseport>
+
+Enable SO_REUSEPORT for better load distribution across workers.
+
+=item C<--epoll-exclusive>
+
+Enable EPOLLEXCLUSIVE mode (Linux 4.5+) for exclusive wakeup of workers.
+
+=item C<--read-priority=N>
+
+Set EV priority for read events (-2 to 2).
+
+=item C<--write-priority=N>
+
+Set EV priority for write events (-2 to 2).
+
+=item C<--accept-priority=N>
+
+Set EV priority for accept events (-2 to 2).
+
+=item C<--keepalive> / C<--no-keepalive>
+
+Enable or disable HTTP keep-alive connections.
+
+=item C<--read-timeout=N>
+
+Set read/keep-alive timeout in seconds.
+
+=item C<--max-connection-reqs=N>
+
+Maximum requests per keep-alive connection (0 for unlimited).
+
+=item C<--max-accept-per-loop=N>
+
+Maximum connections to accept per event loop iteration (default: 64).
+
+=item C<--max-connections=N>
+
+Maximum concurrent connections (0 for unlimited). Provides DoS protection.
+
+=item C<--header-timeout=N>
+
+Timeout in seconds for receiving complete HTTP headers (can be fractional).
+This is separate from the general read timeout.
+
+=item C<--reverse-proxy> / C<--no-reverse-proxy>
+
+Enable or disable reverse proxy mode. When enabled, Feersum trusts
+X-Forwarded-For and X-Forwarded-Proto headers to determine the client
+IP address and URL scheme respectively.
+
+=item C<--proxy-protocol> / C<--no-proxy-protocol>
+
+Enable or disable PROXY protocol support (HAProxy protocol). When enabled,
+each new connection must begin with a PROXY protocol v1 or v2 header before
+any HTTP or TLS data. Works with both plain HTTP and TLS listeners.
+
+=item C<--tls-cert-file=FILE>
+
+Path to the TLS certificate file (PEM format). Must be used together with
+C<--tls-key-file>. Enables TLS 1.3 on all listeners.
+
+=item C<--tls-key-file=FILE>
+
+Path to the TLS private key file (PEM format). Must be used together with
+C<--tls-cert-file>.
+
+=item C<--h2>
+
+Enable HTTP/2 negotiation via ALPN on TLS listeners. Requires TLS to be
+enabled (C<--tls-cert-file> and C<--tls-key-file>). H2 is off by default.
+
+=back
 
 When running in PSGI mode (non-native), L<Plack::Runner> is used.  See that
 module for documentation and defaults.

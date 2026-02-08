@@ -69,6 +69,79 @@ if ($convert_deps) {
 use Config;
 my $steal = ($] >= 5.012 && !defined($Config{useithreads}));
 
+# Optional TLS/H2 support
+my (@extra_libs, @extra_defines, @extra_inc, @extra_objects);
+
+# On older Linux (glibc < 2.17), clock_gettime lives in librt
+if ($^O eq 'linux') {
+    push @extra_libs, '-lrt';
+}
+
+# picotls for TLS 1.3 (vendored submodule in picotls-git/)
+# Requires OpenSSL: detected via Alien::OpenSSL or system headers.
+my $has_tls = 0;
+if (-d 'picotls-git/include' && -f 'picotls-git/lib/picotls.c') {
+    # Try Alien::OpenSSL first, then fall back to system OpenSSL detection
+    my ($openssl_cflags, $openssl_libs);
+    if (eval { require Alien::OpenSSL; 1 }) {
+        $openssl_cflags = Alien::OpenSSL->cflags;
+        $openssl_libs   = Alien::OpenSSL->libs;
+        warn "Feersum: OpenSSL found via Alien::OpenSSL\n";
+    } else {
+        # Fall back to probing system OpenSSL headers
+        require ExtUtils::CBuilder;
+        my $cb = ExtUtils::CBuilder->new(quiet => 1);
+        my $test_src = "openssl_test_$$.c";
+        {
+            open my $fh, '>', $test_src or die "Cannot write $test_src: $!";
+            # Check for OpenSSL >= 1.1.0 (X25519 support required by picotls)
+            print $fh "#include <openssl/opensslv.h>\n";
+            print $fh "#if OPENSSL_VERSION_NUMBER < 0x10100000L\n";
+            print $fh "#error OpenSSL too old for picotls (need >= 1.1.0)\n";
+            print $fh "#endif\n";
+            print $fh "#include <openssl/evp.h>\n";
+            print $fh "int main() { return 0; }\n";
+            close $fh;
+        }
+        my $has_openssl = eval { $cb->compile(source => $test_src); 1 };
+        unlink $test_src;
+        unlink "openssl_test_$$.o";
+
+        if ($has_openssl) {
+            $openssl_cflags = '';
+            $openssl_libs   = '-lssl -lcrypto';
+            warn "Feersum: OpenSSL found via system headers\n";
+        }
+    }
+
+    if ($openssl_cflags || $openssl_libs) {
+        push @extra_inc,     '-Ipicotls-git/include';
+        push @extra_inc,     $openssl_cflags if $openssl_cflags && $openssl_cflags =~ /\S/;
+        push @extra_defines, '-DFEERSUM_HAS_TLS';
+        push @extra_libs,    $openssl_libs;
+        # Build picotls source files as object files
+        push @extra_objects, 'picotls-core.o', 'picotls-openssl.o', 'picotls-pembase64.o', 'picotls-hpke.o';
+        $has_tls = 1;
+        warn "Feersum: TLS support enabled (picotls vendored submodule)\n";
+    } else {
+        warn "Feersum: TLS support disabled (OpenSSL not found; install Alien::OpenSSL or OpenSSL dev headers)\n";
+    }
+} else {
+    warn "Feersum: TLS support disabled (picotls-git submodule not found)\n";
+}
+
+# Optional: nghttp2 for HTTP/2 (via Alien::nghttp2, requires TLS)
+if ($has_tls && eval { require Alien::nghttp2; 1 }) {
+    my $cflags = Alien::nghttp2->cflags;
+    my $libs   = Alien::nghttp2->libs;
+    push @extra_inc,     $cflags if $cflags =~ /\S/;
+    push @extra_libs,    $libs;
+    push @extra_defines, '-DFEERSUM_HAS_H2';
+    warn "Feersum: HTTP/2 support enabled (nghttp2 via Alien::nghttp2)\n";
+} elsif ($has_tls) {
+    warn "Feersum: HTTP/2 support disabled (Alien::nghttp2 not found)\n";
+}
+
 WriteMakefile(ev_args(
     NAME          => 'Feersum',
     VERSION_FROM  => 'lib/Feersum.pm',
@@ -77,6 +150,7 @@ WriteMakefile(ev_args(
     LICENSE       => 'perl',
     CONFIGURE_REQUIRES => {
         'EV' => 4.00,
+        'ExtUtils::CBuilder' => 0,
         'ExtUtils::MakeMaker' => 6.51,
     },
     BUILD_REQUIRES => {
@@ -89,22 +163,50 @@ WriteMakefile(ev_args(
     PREREQ_PM => {
         'EV' => 4.00,
         'Scalar::Util' => 1.19,
-        'HTTP::Entity::Parser' => '0.20',
         map { $_ => $want{$_} } grep { !/^Test::/ && $have{$_} } keys %want
     },
     META_MERGE => {
         recommends => {
+            'Alien::OpenSSL' => 0,
+            'Alien::nghttp2' => 0,
             map { $_ => $want{$_} } grep { !$have{$_} } keys %want
         },
         resources => {
-            repository => 'git://github.com/stash/Feersum.git',
+            repository => 'https://github.com/stash/Feersum.git',
             license => 'http://dev.perl.org/licenses/',
         },
-        'no_index' => {directory => ['eg','picohttpparser-git']},
+        'no_index' => {directory => ['eg','picohttpparser-git','picotls-git']},
     },
-    LIBS   => [''],
+    LIBS   => [join(' ', @extra_libs) || ''],
     EXE_FILES => ['bin/feersum'],
-    DEFINE => ($steal ? '-DFEERSUM_STEAL' : ''),
-    INC    => '-I.',
+    DEFINE => join(' ', ($steal ? '-DFEERSUM_STEAL' : ''), @extra_defines),
+    INC    => join(' ', '-I.', @extra_inc),
     dynamic_lib => {OTHERLDFLAGS => $otherldflags},
+    (@extra_objects ? (OBJECT => '$(BASEEXT)$(OBJ_EXT) ' . join(' ', @extra_objects)) : ()),
 ));
+
+# Custom build rules for picotls object files
+package MY;
+sub postamble {
+    my $self = shift;
+    my $postamble = '';
+    if (-d 'picotls-git/include') {
+        # Build picotls-core.o from picotls-git/lib/picotls.c
+        $postamble .= <<'MAKE';
+
+picotls-core.o: picotls-git/lib/picotls.c picotls-git/include/picotls.h
+	$(CC) -c $(PASTHRU_INC) $(INC) $(CCFLAGS) $(OPTIMIZE) $(CCCDLFLAGS) $(DEFINE) -Ipicotls-git/include -o picotls-core.o picotls-git/lib/picotls.c
+
+picotls-openssl.o: picotls-git/lib/openssl.c picotls-git/include/picotls/openssl.h picotls-git/include/picotls.h
+	$(CC) -c $(PASTHRU_INC) $(INC) $(CCFLAGS) $(OPTIMIZE) $(CCCDLFLAGS) $(DEFINE) -Ipicotls-git/include -o picotls-openssl.o picotls-git/lib/openssl.c
+
+picotls-pembase64.o: picotls-git/lib/pembase64.c picotls-git/include/picotls.h
+	$(CC) -c $(PASTHRU_INC) $(INC) $(CCFLAGS) $(OPTIMIZE) $(CCCDLFLAGS) $(DEFINE) -Ipicotls-git/include -o picotls-pembase64.o picotls-git/lib/pembase64.c
+
+picotls-hpke.o: picotls-git/lib/hpke.c picotls-git/include/picotls.h
+	$(CC) -c $(PASTHRU_INC) $(INC) $(CCFLAGS) $(OPTIMIZE) $(CCCDLFLAGS) $(DEFINE) -Ipicotls-git/include -o picotls-hpke.o picotls-git/lib/hpke.c
+
+MAKE
+    }
+    return $postamble;
+}

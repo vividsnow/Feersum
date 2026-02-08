@@ -1,20 +1,6 @@
 Timeouts
     * slow responses? (feasable? just let TCP do it?)
 
-psgi.input streaming
-
-    * add a "poll_cb()" method to the psgi.input handle as an extension?  EV
-    gets to schedule the watcher in that case rather than bleeding the fd to
-    the handler.
-    * related: Connection: close bodies
-    * related: Transfer-Encoding: chunked bodies
-
-IO::Handle-like responses
-
-    * check if it's got a real file descriptor? optimize (libeio or similar
-    for non-blocking sendfile?) (v1.1)
-    * wait for readability using an ev watcher? (v1.1)
-
 streamed responses
 
     * instead of an implicit "low water mark" of 0 for the poll_cb
@@ -38,27 +24,10 @@ read right away?
 
 multiple Feersum threads, one Perl thread?
 
-WebSocket support (v1.1)
-
-    * http://www.whatwg.org/specs/web-socket-protocol/
-    * Support psgix.io and Web::Hippie already (0.981), but would be good to
-    accelerate it.
-    * Do the handshake in C/XS, call request_handler once request is complete.
-    * I/O is done using the streaming interface (buffered)
-    * requires random numbers (drand48?) and an MD5 implementation (link
-    openssl? use the guts of Digest::MD5 somehow?)
-    * make this a separate module since if it brings in an openssl deps.
-    * will this work for PSGI? magic psgix.web_socket or something?
-
-Release t/Utils.pm's "simple_client" as "anyevent::anotherhttp" or something?
-
-accept4
-    * available on newer linuxes, saves calls to fcntl for setting NONBLOCK
-    and CLOEXEC
+WebSocket handshake acceleration in XS
+    * Currently supported via H2 Extended CONNECT tunnels (RFC 8441) and psgix.io
+    * Accelerating the H1 handshake in C/XS would reduce overhead
 
 JSON accelleration?
     * can write_json() an element in an array of things? automagically call JSON::XS stuff?
     * middleware with XS-accellerator?
-
-True pre-forking support
-    * serialize accept() calls

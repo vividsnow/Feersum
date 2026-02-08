@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || 1;
 use Test::More tests => 32;
 use Test::Fatal;
 use utf8;
@@ -35,8 +37,6 @@ $cb = sub {
     pass "called back!";
     my $r = shift;
     isa_ok $r, 'Feersum::Connection', 'got an object!';
-#     use Devel::Peek();
-#     Devel::Peek::Dump($r);
     my $env = $r->env();
     ok $env, "got env";
     is $env->{HTTP_USER_AGENT}, 'FeersumSimpleClient/1.0', 'got a ua!';
@@ -61,7 +61,7 @@ $cv->begin;
 
 my $w = simple_client GET => '/?qqqqq',
     name => 'ascii',
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client 1 got 200";
@@ -76,7 +76,7 @@ $cv->begin;
 my $w2 = simple_client GET => "/?zzzzz",
     name => 'unicode',
     headers => { 'X-Unicode-Please' => 1 },
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client 2 got 200";

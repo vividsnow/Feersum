@@ -19,7 +19,7 @@ sub write_handle {
 
 sub start_response {
     croak "start_response is deprecated; ".
-        "use start_streaming() or start_whole_response() instead";
+        "use start_streaming() or send_response() instead";
 }
 
 sub initiate_streaming {
@@ -78,8 +78,7 @@ For a response with a Content-Length header:
     Feersum->endjinn->request_handler(sub {
         my $req = shift; # this is a Feersum::Connection object
         my $env = $req->env();
-        $req->start_whole_response(200, ['Content-Type' => 'text/plain']);
-        $req->write_whole_body(\"Ergrates FTW.");
+        $req->send_response(200, ['Content-Type' => 'text/plain'], \"Ergrates FTW.");
     });
 
 =head1 DESCRIPTION
@@ -88,8 +87,8 @@ Encapsulates an HTTP connection to Feersum.  It's roughly analogous to an
 C<Apache::Request> or C<Apache2::Connection> object, but differs significantly
 in functionality.
 
-Until Keep-Alive functionality is supported (if ever) this means that a
-connection is B<also> a request.
+With HTTP/1.1 Keep-Alive support, multiple requests can be served over
+the same connection.
 
 See L<Feersum> for more examples on usage.
 
@@ -140,9 +139,45 @@ Supposedly clients and a lot of proxies support the C<Connection: close>
 stream-style, see support in Varnish at
 http://www.varnish-cache.org/trac/ticket/400
 
+=item C<< $req->is_http11 >>
+
+Returns true if the request was made using HTTP/1.1, false otherwise.
+Useful for determining protocol capabilities before sending a response.
+
+=item C<< $req->is_keepalive >>
+
+Returns true if the connection has keep-alive enabled for this request.
+This takes into account the HTTP version, Connection header, and server
+configuration.
+
 =item C<< $req->fileno >>
 
 The socket file-descriptor number for this connection.
+
+=item C<< $req->io >>
+
+Returns an L<IO::Handle> for the underlying connection socket (typically an
+L<IO::Socket::INET>).
+This is the native interface equivalent of C<psgix.io> in the PSGI environment.
+Any buffered request data will be pushed back into the socket's read buffer.
+
+For HTTP/2 Extended CONNECT streams (RFC 8441), this returns one end of a Unix
+socketpair instead of the raw TCP socket. Feersum shuttles data between the
+other end of the pair and H2 DATA frames internally. The handle is
+bidirectional and suitable for WebSocket or other tunnel protocols.
+
+B<WARNING>: Once you call this method, Feersum relinquishes control of the
+socket. You are responsible for all I/O and must not use other Feersum
+response methods on this connection.
+
+=item C<< $req->return_from_io($io) >>
+
+Returns control of the socket back to Feersum after C<io()> was called.
+This allows keepalive to continue working if you decided not to upgrade
+the connection (e.g., WebSocket handshake failed). Any buffered data in
+the IO handle will be pulled back into Feersum's read buffer.
+
+Returns the number of bytes pulled back from the IO buffer.
 
 =item C<< $req->response_guard($guard) >>
 
@@ -150,59 +185,80 @@ Register a guard to be triggered when the response is completely sent and the
 socket is closed.  A "guard" in this context is some object that will do
 something interesting in its DESTROY/DEMOLISH method. For example, L<Guard>.
 
-=item C<< my $env = $req->method >>
+=item C<< my $method = $req->method >>
 
 req method (GET/POST..) (psgi REQUEST_METHOD)
 
-=item C<< my $env = $req->uri >>
+=item C<< my $uri = $req->uri >>
 
 full request uri (psgi REQUEST_URI)
 
-=item C<< my $env = $req->protocol >>
+=item C<< my $protocol = $req->protocol >>
 
 protocol (psgi SERVER_PROTOCOL)
 
-=item C<< my $env = $req->path >>
+=item C<< my $path = $req->path >>
 
 percent decoded request path (psgi PATH_INFO)
 
-=item C<< my $env = $req->query >>
+=item C<< my $query = $req->query >>
 
 request query (psgi QUERY_STRING)
 
-=item C<< my $env = $req->content_length >>
+=item C<< my $len = $req->content_length >>
 
-body content lenght (psgi CONTENT_LENGTH)
+body content length (psgi CONTENT_LENGTH)
 
-=item C<< my $env = $req->input >>
+=item C<< my $input = $req->input >>
 
 input body handler (psgi.input), it is advised to close it after read is done
 
-=item C<< my $env = $req->headers([normalization_style]) >>
+=item C<< my $headers = $req->headers([normalization_style]) >>
 
-an array of headers if form of [name, value, name, value, ...]
+Returns a hash reference of headers in form of { name => value, ... }.
 
-normalization_style is one of:
+normalization_style is one of (always use named constants, not numeric values):
 
-0 - skip normalization (default)
-HEADER_NORM_LOCASE - "content-type"
-HEADER_NORM_UPCASE - "CONTENT-TYPE"
-HEADER_NORM_LOCASE_DASH - "content_type"
-HEADER_NORM_UPCASE_DASH - "CONTENT_TYPE" (like PSGI, but without "HTTP_" prefix)
+HEADER_NORM_SKIP (0) - skip normalization (default)
+HEADER_NORM_UPCASE_DASH (1) - "CONTENT_TYPE" (like PSGI, but without "HTTP_" prefix)
+HEADER_NORM_LOCASE_DASH (2) - "content_type"
+HEADER_NORM_UPCASE (3) - "CONTENT-TYPE"
+HEADER_NORM_LOCASE (4) - "content-type"
 
-One can export these constants via c<<use Feersum 'HEADER_NORM_LOCASE'>>
+One can export these constants via C<< use Feersum 'HEADER_NORM_LOCASE' >>
 
 =item C<< my $value = $req->header(name) >>
 
 simple lookup for header value, name should be in lowercase, eg. 'content-type'
 
-=item C<< my $env = $req->remote_address >>
+=item C<< my $addr = $req->remote_address >>
 
-remote address (psgi REMOTE_ADDR)
+Remote address of the connection (psgi REMOTE_ADDR). This always returns
+the actual socket peer address.
 
-=item C<< my $env = $req->remote_port >>
+=item C<< my $port = $req->remote_port >>
 
-remote port (psgi REMOTE_PORT)
+Remote port of the connection (psgi REMOTE_PORT).
+
+=item C<< my $addr = $req->client_address >>
+
+Client address, respecting reverse proxy mode. When C<reverse_proxy> is
+enabled and X-Forwarded-For header is present, returns the first (leftmost)
+IP from that header. Otherwise returns the same as C<remote_address>.
+
+=item C<< my $scheme = $req->url_scheme >>
+
+URL scheme (http or https), respecting reverse proxy mode. When
+C<reverse_proxy> is enabled and X-Forwarded-Proto header is present,
+returns that value. Otherwise returns "http".
+
+=item C<< my $tlvs = $req->proxy_tlvs >>
+
+Returns a hash reference of PROXY protocol v2 TLV (Type-Length-Value)
+extensions, or C<undef> if no TLVs were received. Keys are TLV type
+numbers (as integers), values are raw TLV data bytes. Only populated
+when C<proxy_protocol> is enabled and the client sends a v2 header
+with TLV extensions (e.g. PP2_TYPE_SSL, PP2_TYPE_AUTHORITY).
 
 =back
 
@@ -224,7 +280,7 @@ use psgi.input instead
 
 =item C<< $req->start_response(...) >>
 
-use start_streaming() or start_whole_response() instead
+use start_streaming() or send_response() instead
 
 =item C<< $req->initiate_streaming(...) >>
 

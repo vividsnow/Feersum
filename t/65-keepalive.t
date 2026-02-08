@@ -1,12 +1,14 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || 1;
 use Test::More;
 use utf8;
 use lib 't'; use Utils;
 
 BEGIN {
-    plan skip_all => 'no applicable on win32'
+    plan skip_all => 'not applicable on win32'
         if $^O eq 'MSWin32';
     plan skip_all => "Need Test::SharedFork >=0.25 to run this test"
         unless eval 'require Test::SharedFork; $Test::SharedFork::VERSION >= 0.25';
@@ -34,7 +36,7 @@ if ($pid == 0) { # child
         my $runner = Feersum::Runner->new(
             listen => [$sock_path],
             keepalive => 1,
-            read_timeout => 1,
+            read_timeout => 1 * TIMEOUT_MULT,
             max_connection_reqs => 4,
             app => sub {
                 my $r = shift;
@@ -74,12 +76,12 @@ if ($pid == 0) { # child
             $hdl->destroy;
             $cv->send;
         },
-        timeout => 2
+        timeout => 3 * TIMEOUT_MULT
     );
-    $hdl->push_write("GET / HTTP/1.1\015\012\015\012");
+    $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012");
     $hdl->push_read(line => "\015\012\015\012" => sub {
         unlike $_[1], qr(Connection), 'http/1.1 no connection header';
-        $hdl->push_write("GET / HTTP/1.1\015\012Connection: close\015\012\015\012");
+        $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012Connection: close\015\012\015\012");
         $hdl->push_read(line => "\015\012\015\012" => sub {
             like $_[1], qr(Connection: close), 'http/1.1 connection close reply';
             $hdl->on_read(sub {});
@@ -110,14 +112,14 @@ if ($pid == 0) { # child
             $hdl->destroy;
             $cv->send;
         },
-        timeout => 2
+        timeout => 3 * TIMEOUT_MULT
     );
     my $w;
-    $hdl->push_write("GET / HTTP/1.1\015\012\015\012");
+    $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012");
     $hdl->push_read(line => "\015\012\015\012" => sub {
         unlike $_[1], qr(Connection), 'http/1.1 no connection header';
         $hdl->on_read(sub {});
-        $w = AE::timer 1.1, 0, sub { $hdl->push_write("GET / HTTP/1.1\015\012\015\012") };
+        $w = AE::timer 1.1 * TIMEOUT_MULT, 0, sub { $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012") };
     });
     $cv->recv;
     undef $hdl;
@@ -144,7 +146,7 @@ if ($pid == 0) { # child
             $hdl->destroy;
             $cv->send;
         },
-        timeout => 2
+        timeout => 3 * TIMEOUT_MULT
     );
     $hdl->push_write("GET / HTTP/1.0\015\012Connection: keep-alive\015\012\015\012");
     $hdl->push_read(line => "\015\012\015\012" => sub {
@@ -182,12 +184,12 @@ if ($pid == 0) { # child
             $hdl->destroy;
             $cv->send;
         },
-        timeout => 2
+        timeout => 3 * TIMEOUT_MULT
     );
 
     $send_request = sub {
         $request_count++;
-        $hdl->push_write("GET / HTTP/1.1\015\012\015\012");
+        $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012");
         $hdl->push_read(line => "\015\012\015\012" => sub {
             if ($request_count < 4) {
                 unlike $_[1], qr(Connection: close), "request $request_count: no close header";
