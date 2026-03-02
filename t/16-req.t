@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use Test::More tests => 18;
 use Test::Fatal;
 use utf8;
@@ -42,7 +44,7 @@ my $cv = AE::cv;
 my $w = simple_client
     POST => '/aaa?a=1',
     body => ('x' x 1000),
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub { my ($body, $hdr) = @_; is $hdr->{Status}, 200, "got 200"; $cv->send };
 
 $cv->recv;

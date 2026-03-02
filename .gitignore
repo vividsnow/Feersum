@@ -13,3 +13,7 @@ Feersum-*.tar.gz
 MYMETA.yml
 .DS_Store
 MYMETA.json
+feersum_probes.h
+sdt_test_*.so
+nghttp2_test_*.so
+*~

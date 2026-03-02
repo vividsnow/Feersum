@@ -23,7 +23,7 @@ $evh->request_handler(sub {
     my $r = shift;
     my $n = $counter++;
     my $env = $r->env;
-    $r->send_response("200 OK", [
+    $r->send_response(200, [
         'Content-Type' => 'text/plain',
         'Connection' => 'close',
     ], \"Hello customer number $n\n");

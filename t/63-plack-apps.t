@@ -1,7 +1,6 @@
 #!perl
 use strict;
 use Test::More;
-use blib;
 use lib 't'; use Utils;
 BEGIN {
     $ENV{PLACK_TEST_IMPL} = 'Server';

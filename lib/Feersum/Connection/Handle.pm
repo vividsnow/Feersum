@@ -4,7 +4,7 @@ use strict;
 use Carp qw/croak/;
 
 sub new {
-    Carp::croak "Cannot instantiate Feersum::Connection::Handles directly";
+    Carp::croak "Cannot instantiate Feersum::Connection::Handle directly";
 }
 
 package Feersum::Connection::Reader;
@@ -38,17 +38,16 @@ Feersum::Connection::Handle - PSGI-style reader/writer objects.
 For read handles:
 
     my $buf;
-    my $r = delete $env{'psgi.input'};
+    my $r = delete $env->{'psgi.input'};
     $r->read($buf, 1, 1); # read the second byte of input without moving offset
-    $r->read($buf, $env{CONTENT_LENGTH}); # append the whole input
+    $r->read($buf, $env->{CONTENT_LENGTH}); # append the whole input
     $r->close(); # discards any un-read() data
 
     # assuming the handle is "open":
     $r->seek(2,SEEK_CUR); # returns 1, discards skipped bytes
     $r->seek(-1,SEEK_CUR); # returns 0, can't seek back
-    
-    # not yet supported, throws exception:
-    # $r->poll_cb(sub { .... });
+
+    $r->poll_cb(sub { .... });
 
 For write handles:
 
@@ -93,13 +92,15 @@ hash.
 =item C<< $r->seek(...) >>
 
 Seeking is partially supported.  Feersum discards skipped-over bytes to
-conserve memory.
+conserve memory.  B<Note:> SEEK_SET is treated the same as SEEK_CUR (always
+relative to the current position), since the underlying buffer is consumed
+as it is read and absolute positioning is not supported.
 
     $r->seek(0,SEEK_CUR);  # returns 1
     $r->seek(-1,SEEK_CUR); # returns 0
     $r->seek(-1,SEEK_SET); # returns 0
-    $r->seek(2,SEEK_CUR); # returns 1, discards skipped bytes
-    $r->seek(42,SEEK_SET); # returns 1 if room, discards skipped bytes
+    $r->seek(2,SEEK_CUR);  # returns 1, discards 2 bytes
+    $r->seek(42,SEEK_SET); # same as SEEK_CUR: discards 42 bytes
     $r->seek(-8,SEEK_END); # returns 1 if room, discards skipped bytes
 
 =item C<< $r->close() >>
@@ -108,7 +109,9 @@ Discards the remainder of the input buffer.
 
 =item C<< $r->poll_cb(sub { .... }) >>
 
-B<NOT YET SUPPORTED>.  PSGI only defined poll_cb for the Writer object.
+Register a callback to be called when more request body data is available.
+The callback receives the Reader object as its argument. Useful for streaming
+request body reads with Expect: 100-continue.
 
 =back
 
@@ -147,26 +150,47 @@ writer is dropped.
 
 =item C<< $w->poll_cb(sub { .... }) >>
 
-Register a callback to be called when the write buffer is empty.  Pass in
+Register a callback to be called when the write buffer drains to (or below)
+the server's C<wbuf_low_water> threshold (default: 0, i.e. empty).  Pass in
 C<undef> to unset.  The sub can call C<close()>.
 
 A reference to the writer is passed in as the first and only argument to the
 sub.  It's recommended that you use C<$_[0]> rather than closing-over on C<$w>
 to prevent a circular reference.
 
+=item C<< $w->return_from_psgix_io($io) >>
+
+Returns control of the socket back to Feersum after C<psgix.io> was used.
+This is the PSGI-handle equivalent of C<< $req->return_from_io($io) >> on
+the connection object.  See L<Feersum::Connection/return_from_io> for details.
+
+=item C<< $w->sendfile($fh [, $offset, $length]) >>
+
+Send file contents using zero-copy sendfile(2) system call. Linux only.
+The file handle should be a regular file opened for reading. The response
+should have a Content-Length header set appropriately. After calling
+sendfile(), call C<close()> on the writer.
+
+Optional C<$offset> (bytes to skip from start, default 0) and C<$length>
+(bytes to send, default remainder of file) allow sending a portion of
+the file.
+
+B<Note:> Not supported for HTTP/2 responses. Use C<write()> instead.
+
+    my $w = $req->start_streaming(200, [
+        'Content-Type' => 'application/octet-stream',
+        'Content-Length' => -s $filename,
+    ]);
+    open my $fh, '<', $filename or die $!;
+    $w->sendfile($fh);
+    close $fh;
+    $w->close();
+
 =back
 
 =head2 Common methods.
 
 Methods in common to both types of handles.
-
-=begin comment
-
-=item C<< Feersum::Connection::Handle->new() >>
-
-Shouldn't be called directly; L<Feersum> will create these objects.
-
-=end comment
 
 =over 4
 
