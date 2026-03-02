@@ -1,5 +1,42 @@
 Revision history for Perl extension Feersum
 
+1.507
+        Features:
+        - multi-server: per-server struct, multi-listener, new_instance()
+        - chunked request body, expect 100-continue
+        - sendfile() zero-copy (linux), io()/return_from_io()
+        - header_timeout, max_connections, pause_accept/resume_accept
+        - so_reuseport, epollexclusive, max_accept_per_loop
+        - ipv6, libev priority controls, active_conns/total_requests
+        - proxy protocol v1/v2
+        - tls 1.3 via picotls+openssl, per-listener contexts
+        - http/2 via nghttp2: multiplexing, streaming, flow control,
+          extended CONNECT / websocket tunnels (rfc 8441)
+        - PATCH method now accepted (was 405)
+        - max_body_len() runtime tunable
+        - max_uri_len() runtime tunable
+        - header name length validation (431 for >128 bytes)
+        - TLS context refcounting (safe set_tls/unlisten while connected)
+        - pipeline body consumption guard (force close on unread body)
+
+        Backward incompatibly:
+        - Requires Perl 5.14+ (was 5.8.7)
+        - Feersum object is no longer a hashref. Code that accessed
+          $feersum->{socket} must use the public API instead.
+          Feersum->endjinn, use_socket(), and all set_* methods work
+          as before.
+        - Default MAX_BODY_LEN reduced from 2 GB to 64 MB. Applications
+          accepting large uploads must call $server->max_body_len($bytes)
+          to raise the limit.
+        - psgi.input is now always a valid handle (PSGI 1.1 compliant).
+          Previously undef for bodyless requests (GET/HEAD). Code that
+          checked truthiness of psgi.input should check CONTENT_LENGTH
+          or REQUEST_METHOD instead.
+        - Removed long-deprecated methods that already croaked:
+          read_handle(), write_handle(), start_response(),
+          initiate_streaming()
+        - HTTP::Entity::Parser removed from PREREQ_PM (was unused)
+
 1.505 Wed Apr 09 16:20:00 2025 -0200
         - pipeline fix
         - minor: manifest fix and test tweaks
