@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use Test::More tests => 53;
 use Test::Fatal;
 use Fcntl qw/SEEK_CUR SEEK_SET SEEK_END/;
@@ -88,7 +90,7 @@ $cv->begin;
 my $w = simple_client POST => "/uppercase", 
 headers => { 'X-Client' => 1 },
 body => 'testing partial reads',
-timeout => 3,
+timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 200, 'ok';
@@ -100,7 +102,7 @@ $cv->begin;
 my $w2 = simple_client POST => "/uppercase", 
 headers => { 'X-Client' => 2 },
 body => 'testing slurp',
-timeout => 3,
+timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 200, 'ok';
@@ -112,7 +114,7 @@ $cv->begin;
 my $w3 = simple_client POST => "/uppercase", 
 headers => { 'X-Client' => 3 },
 body => 'blah testing offset',
-timeout => 3,
+timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 200, 'ok';
@@ -124,7 +126,7 @@ $cv->begin;
 my $w4 = simple_client POST => "/uppercase", 
 headers => { 'X-Client' => 4 },
 body => 'seek and you shall find it',
-timeout => 3,
+timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 200, 'ok';

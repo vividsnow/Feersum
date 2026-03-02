@@ -1,5 +1,21 @@
 Revision history for Perl extension Feersum
 
+1.507
+        - multi-server instances, multi-listener, new_instance()
+        - tls 1.3 (picotls+openssl), per-listener TLS contexts, SNI vhosts
+        - http/2 (nghttp2): multiplexing, streaming, extended CONNECT (rfc 8441)
+        - proxy protocol v1/v2 with TLV parsing
+        - chunked request body, expect 100-continue
+        - sendfile() zero-copy, io()/return_from_io()
+        - ipv6, so_reuseport, epollexclusive
+        - header/read/write timeouts, max_connections, max_body_len, max_uri_len
+        - ~34% PSGI throughput improvement
+        - Runner: hot_restart, preload_app, daemonize, pid_file, user/group,
+          after_fork, access_log, graceful_timeout, max_requests_per_worker
+        - requires Perl 5.14+ (was 5.8.7)
+        - Feersum object is no longer a hashref (use public API)
+        - psgi.input always valid (PSGI 1.1 compliant)
+
 1.505 Wed Apr 09 16:20:00 2025 -0200
         - pipeline fix
         - minor: manifest fix and test tweaks

@@ -7,10 +7,12 @@ use Scalar::Util qw/weaken/;
 
 sub assign_request_handler {
     my $self = shift;
-    weaken $self;
     $self->{endjinn}->psgi_request_handler(shift);
+    # Weaken BEFORE creating closure to prevent circular reference
+    # (object -> _term -> closure -> $self -> object)
+    weaken $self;
     # Plack::Loader::Restarter will SIGTERM the parent
-    $self->{_term} = EV::signal 'TERM', sub { $self->quit };
+    $self->{_term} = EV::signal 'TERM', sub { $self && $self->quit };
     return;
 }
 
@@ -44,9 +46,32 @@ parameter to plackup to use Feersum under Plack.
 =head2 Experimental Features
 
 A C<--pre-fork=N> parameter can be specified to put feersum into pre-forked
-mode where N is the number of child processes.  The C<--preload-app> parameter
-that L<Starlet> supports isn't supported yet.  The fork is run immediately
-after startup and after the app is loaded (i.e. in the C<run()> method).
+mode where N is the number of child processes.  Use C<-o preload_app=0> to
+load the app independently in each worker (default: preload before fork).
+
+A C<--reuseport> parameter can be specified to enable SO_REUSEPORT support
+for better multi-core scaling when combined with C<--pre-fork>. Requires
+Linux 3.9+ or similar kernel support.
+
+A C<--epoll-exclusive> parameter can be specified to enable EPOLLEXCLUSIVE
+for reducing thundering herd in pre-fork mode. Requires Linux 4.5+.
+Useful with Server::Starter.
+
+Watcher priority options C<--read-priority>, C<--write-priority>, and
+C<--accept-priority> can be used to set libev I/O watcher priorities.
+Valid range is -2 (lowest) to +2 (highest), default is 0.
+
+TLS, HTTP/2, and PROXY protocol can be configured via C<-o> server options:
+
+    plackup -s Feersum \
+      -o tls_cert_file=server.crt -o tls_key_file=server.key \
+      -o h2=1 -o proxy_protocol=1 app.psgi
+
+B<Note:> The C<sni> option (for virtual hosting with multiple TLS
+certificates) takes an array of hashes and cannot be set via C<-o>;
+use L<Feersum::Runner> directly for SNI configuration.
+
+See L<Feersum::Runner> for full documentation of these options.
 
 =head1 METHODS
 
