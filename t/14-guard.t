@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || 1;
 use Test::More tests => 22;
 use utf8;
 use lib 't'; use Utils;
@@ -40,7 +42,7 @@ $guard_fired = 0;
 $cv->begin;
 $cv->begin; # for the guard
 my $w1 = simple_client GET => '/simple',
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client got 200";
@@ -80,7 +82,7 @@ $cv = AE::cv;
 $cv->begin;
 $guard_fired = 0;
 my $w2 = simple_client GET => '/streamer',
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client got 200";

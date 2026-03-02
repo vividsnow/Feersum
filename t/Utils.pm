@@ -1,12 +1,10 @@
 package Utils;
 use strict;
-use base 'Exporter';
 use Test::More ();
 use Socket qw/SOMAXCONN/;
 use IO::Socket::INET;
-use bytes; no bytes;
 use blib;
-use Carp qw(carp cluck confess croak);
+use Carp qw(carp croak);
 use Encode ();
 use AnyEvent ();
 use AnyEvent::Handle ();
@@ -22,8 +20,6 @@ sub import {
     my ($pkg) = caller;
     no strict 'refs';
     *{$pkg.'::carp'} = \&Carp::carp;
-    *{$pkg.'::cluck'} = \&Carp::cluck;
-    *{$pkg.'::confess'} = \&Carp::confess;
     *{$pkg.'::croak'} = \&Carp::croak;
     *{$pkg.'::guard'} = \&Guard::guard;
     *{$pkg.'::scope_guard'} = \&Guard::scope_guard;
@@ -31,6 +27,9 @@ sub import {
     *{$pkg.'::blessed'} = \&Scalar::Util::blessed;
     *{$pkg.'::get_listen_socket'} = \&get_listen_socket;
     *{$pkg.'::simple_client'} = \&simple_client;
+    *{$pkg.'::build_proxy_v1'} = \&build_proxy_v1;
+    *{$pkg.'::build_proxy_v2'} = \&build_proxy_v2;
+    *{$pkg.'::run_client'} = \&run_client;
 
     return 1;
 }
@@ -116,8 +115,7 @@ sub simple_client ($$;@) {
                 my ($k,$v) = split(/:\s+/,$_);
                 (lc($k),$v);
             } @hdrs;
-            # $hdrs{OrigHead} = $head;
-            if ($status_line =~ m{HTTP/(1.\d) (\d{3}) +(.+)\s*}) {
+            if ($status_line =~ m{HTTP/(1\.\d) (\d{3}) +(.+)\s*}) {
                 $hdrs{HTTPVersion} = $1;
                 $hdrs{Status} = $2;
                 $hdrs{Reason} = $3;
@@ -135,14 +133,12 @@ sub simple_client ($$;@) {
         }
         elsif (exists $hdrs{'content-length'}) {
             return $done->() unless ($hdrs{'content-length'});
-#             Test::More::diag "$name waiting for C-L body";
             $h->push_read(chunk => $hdrs{'content-length'}, sub {
                 $buf = $_[1];
                 return $done->();
             });
         }
         elsif (($hdrs{'transfer-encoding'}||'') eq 'chunked') {
-#             Test::More::diag "$name waiting for T-E:chunked body";
             my $len = 0;
             my ($chunk_reader, $chunk_handler);
             $chunk_handler = sub {
@@ -157,14 +153,14 @@ sub simple_client ($$;@) {
             };
             $chunk_reader = sub {
                 my $hex = $_[1];
-                $len = hex $hex;
-                if (!defined($len)) {
+                if ($hex !~ /^[0-9a-fA-F]+$/) {
                     $err_cb->($h,0,"invalid chunk length '$hex'");
                     undef $chunk_reader;
                     undef $chunk_handler;
                     return;
                 }
-                else {
+                $len = hex $hex;
+                {
                     # add two for after-chunk CRLF
                     $h->push_read(chunk => $len+2, $chunk_handler);
                 }
@@ -174,7 +170,6 @@ sub simple_client ($$;@) {
         elsif ($hdrs{HTTPVersion} eq '1.0' or
                ($hdrs{connection}||'') eq 'close')
         {
-#             Test::More::diag "$name waiting for conn:close body";
             $h->on_read(sub {
                 $buf .= substr($_[0]->{rbuf},0,length($_[0]->{rbuf}),'');
             });
@@ -210,10 +205,97 @@ sub simple_client ($$;@) {
     $strong_h->push_write($head.$CRLF.$CRLF.$body)
         unless $opts{skip_head};
 
-#     $http_req =~ s/$CRLF/<CRLF>\n/sg;
-#     Test::More::diag($http_req);
-    
     return $strong_h;
+}
+
+# Build PROXY protocol v1 header (text format)
+# Usage: build_proxy_v1('TCP4', '192.0.2.1', '192.0.2.2', 12345, 80)
+#        build_proxy_v1('UNKNOWN')  # for health checks
+sub build_proxy_v1 {
+    my ($proto, $src_ip, $dst_ip, $src_port, $dst_port) = @_;
+
+    if ($proto eq 'UNKNOWN') {
+        return "PROXY UNKNOWN\r\n";
+    }
+
+    return "PROXY $proto $src_ip $dst_ip $src_port $dst_port\r\n";
+}
+
+# Build PROXY protocol v2 header (binary format)
+# $cmd: 'LOCAL' or 'PROXY'
+# $family: 'UNSPEC', 'INET' (IPv4), or 'INET6' (IPv6)
+# For PROXY command with INET/INET6, provide addresses
+sub build_proxy_v2 {
+    my ($cmd, $family, $src_ip, $dst_ip, $src_port, $dst_port, $tlvs) = @_;
+
+    # v2 signature
+    my $sig = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
+
+    # version (2) and command
+    my $ver_cmd;
+    if ($cmd eq 'LOCAL') {
+        $ver_cmd = 0x20 | 0x00;  # version 2, LOCAL command
+    } elsif ($cmd eq 'PROXY') {
+        $ver_cmd = 0x20 | 0x01;  # version 2, PROXY command
+    } else {
+        croak "Unknown command: $cmd";
+    }
+
+    # family and protocol
+    my ($fam_proto, $addr_data);
+    if ($family eq 'UNSPEC') {
+        $fam_proto = 0x00;
+        $addr_data = '';
+    } elsif ($family eq 'INET') {
+        $fam_proto = 0x11;  # AF_INET + STREAM
+        # Pack IPv4 addresses
+        my $src_packed = Socket::inet_aton($src_ip) or croak "Invalid src IP: $src_ip";
+        my $dst_packed = Socket::inet_aton($dst_ip) or croak "Invalid dst IP: $dst_ip";
+        $addr_data = $src_packed . $dst_packed . pack('nn', $src_port, $dst_port);
+    } elsif ($family eq 'INET6') {
+        $fam_proto = 0x21;  # AF_INET6 + STREAM
+        # Pack IPv6 addresses
+        my $src_packed = Socket::inet_pton(Socket::AF_INET6(), $src_ip)
+            or croak "Invalid src IPv6: $src_ip";
+        my $dst_packed = Socket::inet_pton(Socket::AF_INET6(), $dst_ip)
+            or croak "Invalid dst IPv6: $dst_ip";
+        $addr_data = $src_packed . $dst_packed . pack('nn', $src_port, $dst_port);
+    } else {
+        croak "Unknown family: $family";
+    }
+
+    # Append TLVs if provided (arrayref of [type, value] pairs)
+    my $tlv_data = '';
+    if ($tlvs && ref($tlvs) eq 'ARRAY') {
+        for my $tlv (@$tlvs) {
+            my ($type, $value) = @$tlv;
+            $tlv_data .= chr($type) . pack('n', length($value)) . $value;
+        }
+    }
+
+    my $addr_len = length($addr_data) + length($tlv_data);
+
+    return $sig . chr($ver_cmd) . chr($fam_proto) . pack('n', $addr_len) . $addr_data . $tlv_data;
+}
+
+sub run_client {
+    my ($label, $code) = @_;
+    my $tmult = $ENV{PERL_TEST_TIME_OUT_FACTOR} || 1;
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        select(undef, undef, undef, 0.3 * $tmult);
+        my $rc = eval { $code->() };
+        if ($@) { warn "$label client error: $@\n"; exit(99); }
+        exit($rc || 0);
+    }
+    my $cv = AE::cv;
+    my $child_status;
+    my $t = AE::timer(15 * $tmult, 0, sub { kill 'QUIT', $pid; $cv->send('timeout') });
+    my $w = AE::child($pid, sub { $child_status = $_[1] >> 8; $cv->send('done') });
+    my $reason = $cv->recv;
+    Test::More::isnt($reason, 'timeout', "$label: did not timeout");
+    Test::More::is($child_status, 0, "$label: client passed");
 }
 
 1;

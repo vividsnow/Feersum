@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || 1;
 use Test::More tests => 143;
 use utf8;
 use Test::Fatal;
@@ -107,7 +109,7 @@ my $cv = AE::cv;
 $cv->begin;
 my $w = simple_client GET => "/what%20is%20wrong%3f?blar",
     headers => {'x-test-num' => 1, 'Referer' => '/wrong'},
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 200, "client 1 got 200";
@@ -125,7 +127,7 @@ sub {
 $cv->begin;
 my $w2 = simple_client GET => "/what%%20is%20good%3F%2?dlux=sonice", 
     headers => {'x-test-num' => 2, 'Referer' => 'good'},
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 200, "client 2 got 200";
@@ -143,7 +145,7 @@ sub {
 $cv->begin;
 my $w3 = simple_client GET => "/no%20query",
     headers => {'x-test-num' => 3, 'Referer' => 'ugly'},
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 200, "client 3 got 200";
@@ -161,13 +163,13 @@ sub {
 $cv->begin;
 my $w4 = simple_client GET => "/no spaces allowed",
     headers => {'x-test-num' => 4, 'Referer' => 'ugly'},
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 400, 'client 4 Bad Request';
     is $headers->{Reason}, "Bad Request";
     is $headers->{'content-type'}, 'text/plain';
-    is $body, "Malformed request.\n", 'client 4 expected error';
+    is $body, "Malformed request\n", 'client 4 expected error';
     $cv->end;
 };
 
@@ -178,7 +180,7 @@ my $w5 = simple_client POST => "/post",
         'Content-Type' => 'text/plain; charset=US-ASCII',
     },
     body => "The post\n",
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
 sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 200, "client 5 got 200";

@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl-version:
+          - '5.16'
+          - '5.18'
+          - '5.20'
+          - '5.22'
+          - '5.24'
+          - '5.26'
+          - '5.28'
+          - '5.30'
+          - '5.32'
+          - '5.34'
+          - '5.36'
+          - '5.38'
+          - '5.40'
+          - '5.42'
+
+    container:
+      image: perldocker/perl-tester:${{ matrix.perl-version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: perl -V
+        run: perl -V
+
+      - name: Install TLS and H2 system dependencies
+        run: |
+          apt-get update -q
+          apt-get install -y -q libssl-dev libnghttp2-dev
+
+      - name: Install EV::MakeMaker
+        run: cpanm -n EV::MakeMaker
+
+      - name: Install TLS and H2 Perl dependencies
+        run: cpanm -n Alien::nghttp2 IO::Socket::SSL
+
+      - name: perl Makefile.PL
+        run: perl Makefile.PL
+
+      - name: Install dependencies
+        run: cpanm -n --installdeps .
+
+      - name: make
+        run: make
+
+      - name: make test
+        run: make test
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl-version:
+          - '5.26'
+          - '5.30'
+          - '5.34'
+          - '5.38'
+          - '5.40'
+          - '5.42'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl-version }}
+
+      - name: perl -V
+        run: perl -V
+
+      - name: Install TLS and H2 system dependencies
+        run: brew install openssl@3 nghttp2
+
+      - name: Install EV::MakeMaker
+        run: cpanm -n EV::MakeMaker
+
+      - name: Install TLS and H2 Perl dependencies
+        run: cpanm -n Alien::OpenSSL Alien::nghttp2 IO::Socket::SSL
+
+      - name: perl Makefile.PL
+        run: perl Makefile.PL
+
+      - name: Install dependencies
+        run: cpanm -n --installdeps .
+
+      - name: make
+        run: make
+
+      - name: make test
+        run: make test
+
+  freebsd:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y perl5 p5-EV p5-AnyEvent p5-Plack p5-Guard p5-Test-Fatal p5-Test-LeakTrace p5-Test-SharedFork p5-JSON-XS p5-HTTP-Entity-Parser p5-Test-TCP p5-HTML-Parser p5-IO-Socket-SSL p5-App-cpanminus nghttp2
+          run: |
+            perl -V
+            cpanm -n Alien::nghttp2
+            perl Makefile.PL
+            make
+            make test
+
+  openbsd:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Test on OpenBSD
+        uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg_add p5-EV p5-AnyEvent p5-Plack p5-Guard p5-Test-Fatal p5-Test-LeakTrace p5-Test-SharedFork p5-JSON-XS p5-HTTP-Entity-Parser p5-Test-TCP p5-HTML-Parser p5-IO-Socket-SSL nghttp2
+            ftp -o - https://cpanmin.us | perl - --notest App::cpanminus
+          run: |
+            perl -V
+            cpanm -n Alien::nghttp2
+            perl Makefile.PL
+            make
+            make test
+
+  netbsd:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Test on NetBSD
+        uses: vmactions/netbsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            /usr/sbin/pkg_add p5-EV p5-AnyEvent p5-Plack p5-Guard p5-Test-Fatal p5-Test-LeakTrace p5-Test-SharedFork p5-JSON-XS p5-HTTP-Entity-Parser p5-Test-TCP p5-HTML-Parser p5-IO-Socket-SSL p5-App-cpanminus nghttp2
+          run: |
+            perl -V
+            cpanm -n Alien::nghttp2
+            perl Makefile.PL
+            make
+            make test
