@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use Test::More tests => 22;
 use utf8;
 use lib 't'; use Utils;
@@ -40,7 +42,7 @@ $guard_fired = 0;
 $cv->begin;
 $cv->begin; # for the guard
 my $w1 = simple_client GET => '/simple',
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client got 200";
@@ -48,7 +50,12 @@ my $w1 = simple_client GET => '/simple',
         $cv->end;
     };
 
+my $bail1 = AE::timer 15 * TIMEOUT_MULT, 0, sub {
+    fail "guard never fired - bailing out instead of hanging";
+    $cv->send;
+};
 $cv->recv;
+undef $bail1;
 is $guard_fired, 1, "guard fired only once";
 pass 'done simple guard';
 
@@ -80,7 +87,7 @@ $cv = AE::cv;
 $cv->begin;
 $guard_fired = 0;
 my $w2 = simple_client GET => '/streamer',
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client got 200";
@@ -88,6 +95,11 @@ my $w2 = simple_client GET => '/streamer',
         $cv->end;
     };
 
+my $bail2 = AE::timer 15 * TIMEOUT_MULT, 0, sub {
+    fail "guard never fired - bailing out instead of hanging";
+    $cv->send;
+};
 $cv->recv;
+undef $bail2;
 is $guard_fired, 1, "guard fired only once";
 pass "all done";

@@ -1,5 +1,203 @@
 Revision history for Perl extension Feersum
 
+1.507
+        - multi-server instances, multi-listener, new_instance()
+        - tls 1.3 (picotls+openssl), per-listener TLS contexts, SNI vhosts
+        - http/2 (nghttp2): multiplexing, streaming, extended CONNECT (rfc 8441),
+          rapid-reset protection (CVE-2023-44487)
+        - proxy protocol v1/v2 with TLV parsing
+        - reverse_proxy mode: trust X-Forwarded-For/-Proto from a trusted
+          upstream (client_address, url_scheme); off by default
+        - ipv6 listeners
+        - header/read/write timeouts, max_connections, max_body_len, max_uri_len,
+          max_read_buf, max_accept_per_loop
+        - active_conns, total_requests, wbuf_low_water,
+          max_h2_concurrent_streams, set_psgix_io
+        - psgix.h2.trailers, psgix.h2.extended_connect, psgix.h2.protocol,
+          psgix.proxy_tlvs
+        - ~34% PSGI throughput improvement
+        - Runner: hot_restart, preload_app, daemonize, pid_file, user/group,
+          after_fork, access_log, graceful_timeout, startup_timeout,
+          max_requests_per_worker
+        - bin/feersum native mode: full Runner option parity (repeatable
+          --listen, --hot-restart, --daemonize, --user/--group, ...)
+        - requires Perl 5.14+ (was 5.8.7)
+        - Feersum object is no longer a hashref (use public API)
+        - psgi.input always valid (PSGI 1.1 compliant)
+        - response header/status-line CRLF injection rejected (CWE-113)
+        - psgi.input close() no longer breaks keepalive or discards an
+          already-pipelined next request
+        - an http/1.0 keep-alive client that pipelines into one segment now
+          gets its second request answered; the buffered request was never
+          parsed until unrelated later traffic arrived, or read_timeout
+          killed it
+        - the header timeout now covers a pipelined request that arrives
+          half-written; it had no deadline at all, and stalling one closed
+          the connection with no 408
+        - graceful shutdown no longer waits out read_timeout on a connection
+          that was busy when it began: the idle sweep runs once, and such a
+          connection went back to keepalive-idle behind it, so the drain took
+          a further 5s by default - the same as Runner's graceful_timeout,
+          which then force-exited a worker that had already finished
+        - graceful_shutdown releases its hold on the event loop (prepare/check/
+          idle watchers and the shared date timer), so shutting down one
+          instance no longer keeps the loop alive for the whole process
+        - an application that sets Connection: close is now obeyed (rfc 9112
+          9.6) instead of having it put on the wire and ignored: the
+          connection was parked in keepalive-idle until read_timeout, and the
+          server's own header went out alongside the application's, giving
+          "close, close" or - to an HTTP/1.0 client asking for keep-alive -
+          the contradictory pair "close, keep-alive".  Connection: Upgrade
+          still passes through untouched
+        - a response to HEAD no longer sends the body (rfc 9110 9.3.2); it
+          previously desynchronised a keepalive connection
+        - tls: a client offering ALPN with no protocol in common now gets a
+          fatal no_application_protocol alert (rfc 7301 3.2) instead of a
+          silent fallback to http/1.1
+        - 205 Reset Content now sends Content-Length: 0 (rfc 7231 6.3.6); it
+          previously had no length delimiter at all on a keepalive connection
+        - http/2 stream creation is no longer rejected by max_connections
+          (max_h2_concurrent_streams bounds streams); streams still count
+          toward active_conns, so they do consume the max_connections budget
+        - fix a crash: a psgi handler that dies leaked a perl stack slot per
+          request, aborting the process after ~100 such requests (since 2010)
+        - psgi env values are per-request copies: assigning REMOTE_ADDR,
+          REQUEST_METHOD or psgi.errors no longer leaks into a later request
+          on the same connection, nor croaks on a read-only value
+        - fix a remote dos: one http/2 HEADERS+RST_STREAM pair killed the
+          worker process. the reset freed the stream before the app answered,
+          and the response path then croaked where no eval could catch it -
+          a single ~50-byte write, so the rapid-reset counter never engaged
+        - every response now carries a Date header (rfc 9110 6.6.1); it was
+          emitted only on HTTP/1.1, so HTTP/1.0 clients and every error
+          response got none
+        - fix a memory leak: every 4xx/5xx the request reader generates itself
+          (malformed request, too many header fields, oversize header block,
+          long uri, oversize body) leaked its entire response buffer, ~256
+          bytes each, so a stream of bad requests grew the worker without
+          bound. the response sv was mortalised inside an ev watcher callback,
+          where nothing ever runs FREETMPS to reap it
+        - fix cross-connection damage after a psgix.io/io() takeover: the app's
+          IO handle SHARES the socket (new_from_fd opens "+<&=", it does not
+          dup), so once the app closed it the kernel could hand that descriptor
+          to the next accept, and the connection's later DESTROY closed it a
+          second time - shutting down an unrelated live connection, silently,
+          with both syscalls succeeding. feersum now declines to close a
+          descriptor it gave away. this also removes the "close ... Bad file
+          descriptor" noise an app saw when it closed its own psgix.io handle
+        - a 405 for an unsupported http/1.x method now carries the Allow header
+          rfc 9110 15.5.6 requires. note the restriction itself is documented
+          now too: http/1.x accepts only GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS
+          and answers anything else, CONNECT included, with 405; http/2 passes
+          every method through. http/1.x tunnels go through psgix.io, not the
+          CONNECT method, which only http/2 has (rfc 8441 extended connect)
+        - max_connections and max_connection_reqs no longer read back as 0,
+          meaning unlimited, when set to a value too large for the internal
+          counter: a cap of 2**31 or more silently became no cap at all
+        - Runner: a fork() failure while respawning a worker no longer strands
+          the slot for good. the croak ran inside an ev watcher callback, where
+          ev catches and discards it, so nothing armed a retry and the worker
+          never came back; without SO_REUSEPORT the supervisor also re-listens
+          across the respawn fork and the skipped unlisten left it serving
+          requests itself, which with pre_fork=1 is a silent degradation to a
+          single process that was never configured to serve. the fork is now
+          eval'd, the unlisten unconditional, and a failure retries through the
+          existing respawn backoff
+        - nine psgi env booleans (psgi.streaming, psgi.nonblocking,
+          psgi.run_once, psgi.multithread, psgi.multiprocess and the four
+          psgix.* flags) were the shared immortals PL_sv_yes/no rather than
+          per-request copies, so middleware assigning to one died with
+          "Modification of a read-only value attempted" and the request became
+          a 500. Plack::Middleware::BufferedStreaming escaped only because
+          Plack::Util::TRUE is itself PL_sv_yes, which sv_setsv short-circuits
+        - perf: the per-request request struct no longer zeroes its 2 KB header
+          array. only [0, num_headers) is ever read, and that memset was ~20%
+          of the native per-request instruction count
+        - perf: tls output is encrypted straight into the connection write
+          buffer instead of into a scratch buffer that was then copied. saves a
+          full copy of every ciphertext byte plus a malloc/free per record
+          batch: ~42k fewer instructions per 16 KB TLS response
+        - a zero-length write truncated the response it was part of. alone in
+          a write batch it makes write()/writev() return 0, which the plain
+          transport read as a fatal error and shut the response down mid-body;
+          under keepalive the connection was then reused, so a client honouring
+          Content-Length read the next response's status line as the tail of
+          this body. reachable from an empty $w->write() or a PSGI IO-handle
+          body whose getline returns an empty string between chunks. the TLS
+          path already skipped zero-length iovecs, so the two disagreed
+        - see the UPGRADING section in the Feersum docs for behaviour changes
+          since 1.505 that need no code change to bite
+
+1.506 Thu Jan 16 00:00:00 2026 +0300
+        Performance:
+        - free-lists for iomatrix, feer_req and rinq structs
+        - cache remote_addr/remote_port per connection
+        - embed sockaddr_storage in feer_conn struct
+        - cached SVs for common HTTP status codes
+        - ASCII case conversion lookup tables
+        - improved likely/unlikely branch hints
+
+        Benchmarks (vs 1.505, keepalive mode, h2load -c100 -t2 -D10s):
+        - TCP PSGI: 139K req/s (+42% vs 98K in 1.505)
+        - TCP Native: 219K req/s (+61% vs 135K in 1.505)
+        - Unix socket PSGI: 184K req/s (+32% vs TCP)
+        - Unix socket Native: 352K req/s (+61% vs TCP)
+
+        Features:
+        - Expect: 100-continue support for HTTP/1.1 clients
+        - Transfer-Encoding: chunked request body support
+        - Native interface io() method for protocol upgrades (WebSocket, etc.)
+        - Native interface return_from_io() for keepalive after io() access
+        - PSGI return_from_psgix_io() for keepalive after psgix.io access
+        - poll_cb support on Reader handles for streaming input
+        - pause_accept/resume_accept methods for backpressure control
+        - sendfile() zero-copy file transfer (Linux)
+        - SO_REUSEPORT for better prefork scaling
+        - EPOLLEXCLUSIVE for prefork thundering herd mitigation (no libev patching needed)
+        - configurable libev watcher priorities (read_priority, write_priority, accept_priority)
+
+        Security:
+        - Request smuggling prevention: reject requests with both
+          Content-Length and Transfer-Encoding headers (RFC 7230)
+        - Reject obsolete header line folding (obs-fold) per RFC 7230
+        - DoS protection: MAX_TRAILER_HEADERS limit for chunked requests
+
+        Bugfixes:
+        - fix uninitialized pointer in feersum_env_headers (potential UB)
+        - fix off-by-one in uri_decode_sv bounds check
+        - fix fcntl calls to preserve existing file descriptor flags
+        - fix RESPOND_SHUTDOWN debug string value
+        - fix av_extend argument for psgi.version array
+        - fix max_connection_reqs type handling for negative values
+        - fix test files missing 'use blib' (t/17-priority.t, t/56-leak-extended.t)
+        - fix error message consistency (remove trailing periods)
+        - fix chunked encoding for streaming responses with Content-Length
+        - fix io_taken flag reset in return_from_psgix_io for keepalive
+        - fix missing HEADER_NORM_UPCASE_DASH in @EXPORT_OK
+
+        Code quality:
+        - add thread-safety documentation and comments to non-thread-safe structures
+        - add unlikely() to error paths consistently
+        - add trailer_count field to connection struct for chunked parsing state
+        - improve assert messages with descriptions
+        - remove dead code: unused str_eq function, obs-fold handlers,
+          RINQ_IS_UNINIT and RINQ_IS_ATTACHED macros
+        - remove unused forward declaration feersum_set_keepalive
+        - remove unused crlf_sv variable
+        - remove unused char* n in feersum_env_headers
+        - remove redundant conditional in keepalive reset
+        - add missing static keyword to ev_idle ei declaration
+        - add default case to switch in feersum_env_headers
+        - use STRLEN instead of int for buffer sizes
+        - improve multiline header tracking variable naming
+        - fix typos: theif -> thief, probaby -> probably
+        - added OOM check in rinq allocation with croak()
+        - update outdated documentation for poll_cb on Reader handles
+        - update outdated documentation for keepalive support
+        - refactor: extract send_100_continue() helper to deduplicate code
+        - refactor: extract free_request() helper to deduplicate request cleanup
+        - refactor: extract feersum_return_from_io() shared helper for io return
+
 1.505 Wed Apr 09 16:20:00 2025 -0200
         - pipeline fix
         - minor: manifest fix and test tweaks

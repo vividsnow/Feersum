@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use constant HARDER => $ENV{RELEASE_TESTING} ? 10 : 1;
 use constant CLIENTS => HARDER * 2;
 use Test::More tests => 4 + 10 * CLIENTS;
@@ -24,8 +26,6 @@ $endjinn->use_socket($socket);
 }
 
 my $cv = AE::cv;
-my $started = 0;
-my $finished = 0;
 $endjinn->request_handler(sub {
     my $r = shift;
     isa_ok $r, 'Feersum::Connection', 'got an object!';
@@ -36,7 +36,6 @@ $endjinn->request_handler(sub {
 
     $cv->begin;
     my $w = $r->start_streaming("200 OK", ['Content-Type' => 'text/plain', 'X-Client' => $cnum, 'X-Fileno' => $r->fileno ]);
-    $started++;
     isa_ok($w, 'Feersum::Connection::Writer', "got a writer $cnum");
     isa_ok($w, 'Feersum::Connection::Handle', "... it's a handle $cnum");
     my @first = (
@@ -58,7 +57,7 @@ sub client {
     $cv->begin;
     my $h; $h = simple_client GET => '/foo',
         name => $cnum,
-        timeout => 15,
+        timeout => 3 * TIMEOUT_MULT,
         proto => '1.1',
         headers => {
             "Accept" => "*/*",

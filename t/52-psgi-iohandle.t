@@ -26,7 +26,10 @@ $evh->use_socket($socket);
     sub new { return bless {lines => $_[1]}, __PACKAGE__ }
     sub getline {
         my $self = shift;
-        Test::More::ok(ref($/) && ${$/} == 4096, '$/ is \4096');
+        # The PSGI contract is "$/ is a chunk-size ref", not the exact
+        # number; asserting 4096 pinned an internal tunable.
+        Test::More::ok(ref($/) eq 'SCALAR' && ${$/} > 0,
+            'PSGI sets $/ to a positive chunk-size ref');
         return @{$self->{lines}} ? shift @{$self->{lines}} : undef;
     }
     sub close {
@@ -47,7 +50,7 @@ my $APP = <<'EOAPP';
 EOAPP
 
 my $app = eval $APP;
-ok $app, 'got an app' || diag $@;
+ok $app, 'got an app' or diag $@;
 $evh->psgi_request_handler($app);
 
 returning_mock: {
@@ -82,7 +85,7 @@ my $APP2 = <<'EOAPP';
 EOAPP
 
 my $app2 = eval $APP2;
-ok $app2, 'got app 2' || diag $@;
+ok $app2, 'got app 2' or diag $@;
 $evh->psgi_request_handler($app2);
 
 returning_glob: {
@@ -112,7 +115,7 @@ my $APP3 = <<'EOAPP';
 EOAPP
 
 my $app3 = eval $APP3;
-ok $app3, 'got app 3' || diag $@;
+ok $app3, 'got app 3' or diag $@;
 $evh->psgi_request_handler($app3);
 
 returning_io_file: {
@@ -147,7 +150,7 @@ my $APP4 = <<'EOAPP';
 EOAPP
 
 my $app4 = eval $APP4;
-ok $app4, 'got app 4' || diag $@;
+ok $app4, 'got app 4' or diag $@;
 $evh->psgi_request_handler($app4);
 
 returning_perlio_layer: {
@@ -181,7 +184,7 @@ my $APP5 = <<'EOAPP';
 EOAPP
 
 my $app5 = eval $APP5;
-ok $app5, 'got app 5' || diag $@;
+ok $app5, 'got app 5' or diag $@;
 $evh->psgi_request_handler($app5);
 
 returning_perlio_layer_from_stream: {

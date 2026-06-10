@@ -27,15 +27,28 @@ foreach my $MODULE ( @MODULES ) {
 	}
 }
 
+# Feersum::Connection::{Reader,Writer} have no .pm file - the XS bootstrap
+# creates the stashes - so Pod::Coverage's "require $package" would fail.
+use Feersum ();
+$INC{'Feersum/Connection/Reader.pm'} = $INC{'Feersum.pm'};
+$INC{'Feersum/Connection/Writer.pm'} = $INC{'Feersum.pm'};
+
+# HEADER_NORM_* are exported by Feersum but documented where they are used, in
+# Feersum::Connection.  Handle::new is internal - handles come from the XS side.
+my @norm_consts = (qr/^HEADER_NORM_/);
+
 my %poded = (
     'Feersum::Connection::Handle' => {
         pod_from => 'blib/lib/Feersum/Connection/Handle.pm',
+        also_private => ['new'],
     },
     'Feersum::Connection::Writer' => {
         pod_from => 'blib/lib/Feersum/Connection/Handle.pm',
+        also_private => ['new'],
     },
     'Feersum::Connection::Reader' => {
         pod_from => 'blib/lib/Feersum/Connection/Handle.pm',
+        also_private => ['new'],
     },
     'Feersum::Connection' => {
         pod_from => 'blib/lib/Feersum/Connection.pm',
@@ -45,13 +58,13 @@ my %poded = (
     },
     'Feersum' => {
         pod_from => 'blib/lib/Feersum.pm',
+        also_private => \@norm_consts,
     },
     'Plack::Handler::Feersum' => {
         pod_from => 'blib/lib/Plack/Handler/Feersum.pm',
     },
-    'feersum' => {
-        pod_from => 'blib/script/feersum',
-    },
+    # bin/feersum is a script, not a module: it cannot be require'd, and
+    # t/99-pod.t already checks its POD is well-formed.
 );
 plan tests => scalar keys %poded;
 while (my ($mod, $params) = each %poded) {
