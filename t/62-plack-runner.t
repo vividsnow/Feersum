@@ -1,7 +1,6 @@
 #!perl
 use strict;
 use Test::More;
-use blib;
 use lib 't'; use Utils;
 BEGIN {
     plan skip_all => "Need Plack >= 0.9950 to run this test"

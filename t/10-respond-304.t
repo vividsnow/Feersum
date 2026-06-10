@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use Test::More tests => 21;
 use Test::Fatal;
 use utf8;
@@ -37,7 +39,7 @@ my $cv = AE::cv;
 $cv->begin;
 my $w = simple_client GET => '/?blef',
     headers => { 'X-Client' => 1 },
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub {
         my ($body, $headers) = @_;
         is $headers->{Status}, 304, "client got 304";
@@ -53,7 +55,7 @@ my $w = simple_client GET => '/?blef',
 $cv->begin;
 my $w2 = simple_client GET => '/?blef',
     headers => { 'X-Client' => 2 },
-    timeout => 3,
+    timeout => 2 * TIMEOUT_MULT,
     sub {
         my ($body, $headers) = @_;
         is $headers->{Status}, 304, "2nd client got 304";

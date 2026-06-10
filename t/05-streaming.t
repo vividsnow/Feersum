@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use constant HARDER => $ENV{RELEASE_TESTING} ? 10 : 1;
 use constant CLIENTS_11 => HARDER * 2;
 use constant CLIENTS_10 => HARDER * 2;
@@ -105,7 +107,7 @@ sub client {
     $cv->begin;
     my $h; $h = simple_client GET => '/foo',
         name => $cnum,
-        timeout => 15,
+        timeout => 3 * TIMEOUT_MULT,
         proto => $is_chunked ? '1.1' : '1.0',
         headers => {
             "Accept" => "*/*",

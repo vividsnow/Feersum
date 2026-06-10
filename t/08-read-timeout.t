@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use constant HARDER => $ENV{RELEASE_TESTING} ? 10 : 1;
 use constant POST_CLIENTS => HARDER*1;
 use constant GET_CLIENTS => HARDER*1;
@@ -54,6 +56,9 @@ is $evh->read_timeout, 8.0, "new timeout set";
 is exception { $evh->read_timeout($default) }, undef, "NV is OK";
 is $evh->read_timeout, $default, "reset to default";
 
+# Use a shorter timeout for the actual client tests to keep the test fast
+# and leave ample margin before the guard timer fires.
+$evh->read_timeout(2.0);
 
 my $cv = AE::cv;
 
@@ -63,7 +68,7 @@ sub timeout_get_client {
     my $ot; $ot = AE::timer rand(1), 0, sub {
         my $h; $h = simple_client GET => '/',
             name => "(get $n)",
-            timeout => 10,
+            timeout => 8 * TIMEOUT_MULT,
             skip_head => 1,
         sub {
             my ($body,$headers) = @_;
@@ -81,7 +86,7 @@ sub timeout_post_client {
     my $ot; $ot = AE::timer rand(1), 0, sub {
         my $h; $h = simple_client POST => '/',
             name => "(post $n)",
-            timeout => 10,
+            timeout => 8 * TIMEOUT_MULT,
             headers => {
                 # C-L with no body puts simple_client into stream mode
                 'Content-Length' => 8,
@@ -94,7 +99,7 @@ sub timeout_post_client {
             undef $h;
         };
         $h->push_write("o "); # 2 out of claimed 8 bytes
-        my $t; $t = AE::timer rand(2.5),0,sub {
+        my $t; $t = AE::timer rand(0.5),0,sub {
             $h->push_write("hai"); # 3 more out of claimed 8 bytes
             undef $t; # keep ref
         };
@@ -121,7 +126,7 @@ sub good_client {
     };
 }
 
-my $t; $t = AE::timer 20, 0, sub {
+my $t; $t = AE::timer 8 * TIMEOUT_MULT, 0, sub {
     $cv->croak("TOO LONG");
 };
 

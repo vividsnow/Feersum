@@ -45,7 +45,7 @@ elsif ($pid == 0) {
     $evh->use_socket($socket);
     $evh->psgi_request_handler($app);
     my $quit; $quit = AE::signal 'QUIT', sub {
-        $evh->graceful_shutdown();
+        $evh->graceful_shutdown(sub { POSIX::_exit(0) });
     };
     AE::cv->recv;
     scope_guard { POSIX::_exit(0) };
@@ -98,7 +98,7 @@ diag $@ if $@;
 my $finished = AE::time();
 
 pass "clients done, waitpid";
-kill 9, $pid;
+kill 'QUIT', $pid;
 waitpid $pid, 0;
 
 my $taken = $finished-$started;

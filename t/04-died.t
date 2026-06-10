@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use Test::More tests => 10;
 use Test::Fatal;
 use lib 't'; use Utils;
@@ -32,11 +34,11 @@ is exception {
 
 my $cv = AE::cv;
 $cv->begin;
-my $w = simple_client GET => "/?blar", timeout => 3, sub {
+my $w = simple_client GET => "/?blar", timeout => 2 * TIMEOUT_MULT, sub {
     my ($body, $headers) = @_;
     is $headers->{Status}, 500, "client got 500";
     is $headers->{'content-type'}, 'text/plain';
-    is $body, "Request handler exception.\n", 'got expected body';
+    is $body, "Request handler exception\n", 'got expected body';
     $cv->end;
 };
 

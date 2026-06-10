@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 5 : 1);
 use constant HARDER => $ENV{RELEASE_TESTING} ? 1 : 0;
 use constant NUM_FORK => HARDER ? 4 : 2;
 use constant CLIENTS => HARDER ? 30 : 4;
@@ -14,13 +16,13 @@ use_ok 'Feersum::Runner';
 my (undef, $port) = get_listen_socket();
 
 my $cv;
-my $test = 0;
 
 sub simple_get {
     my ($port, $n) = @_;
     $cv->begin;
     my $cli; $cli = simple_client GET => "/?q=$n",
         name => "client $n",
+        timeout => 5 * TIMEOUT_MULT,
         sub {
             my ($body,$headers) = @_;
             is($headers->{Status}, 200, "client $n: http success") or diag($headers->{Reason});
@@ -38,7 +40,6 @@ if (!$pid) {
     eval {
         my $runner = Feersum::Runner->new(
             listen => ["localhost:$port"],
-            server_starter => 1,
             app_file => $app_path,
             pre_fork => NUM_FORK,
             quiet => 1,
@@ -48,7 +49,8 @@ if (!$pid) {
     POSIX::exit(0);
 }
 
-select undef, undef, undef, 0.25; # sleep a bit to give the server time to start
+# Wait for server to start - longer on slow machines
+select undef, undef, undef, 0.5 * TIMEOUT_MULT;
 
 $cv = AE::cv;
 simple_get($port, $_) for (1..CLIENTS);

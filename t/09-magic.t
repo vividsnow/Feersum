@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use Test::More tests => 25;
 use Test::Fatal;
 use utf8;
@@ -87,7 +89,7 @@ $cv->begin;
 my $w = simple_client GET => '/',
     name => 'scalar',
     headers => { 'X-Magic-Type' => 'SCALAR' },
-    timeout => 3,
+    timeout => 3 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client 1 got 200";
@@ -100,7 +102,7 @@ $cv->begin;
 my $w2 = simple_client GET => '/',
     name => 'array',
     headers => { 'X-Magic-Type' => 'ARRAY' },
-    timeout => 3,
+    timeout => 3 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client 1 got 200";
@@ -113,7 +115,7 @@ $cv->begin;
 my $w3 = simple_client GET => '/',
     name => 'array',
     headers => { 'X-Magic-Type' => 'SCALAR-in-ARRAY' },
-    timeout => 3,
+    timeout => 3 * TIMEOUT_MULT,
     sub {
         my ($body, $hdr) = @_;
         is $hdr->{Status}, 200, "client 1 got 200";
