@@ -677,6 +677,21 @@ stop_read_timer(struct feer_conn *c) {
     SvREFCNT_dec(c->self);
 }
 
+/* Has the peer hung up?  A peek that returns 0 is EOF; EAGAIN just means a
+ * quiet-but-live client, which is the normal case for a streaming response.
+ * Only for paths that would otherwise never learn the connection is dead. */
+INLINE_UNLESS_DEBUG static bool
+peer_is_gone(struct feer_conn *c)
+{
+    char probe;
+    ssize_t n;
+    if (c->fd < 0) return 1;
+    do {
+        n = recv(c->fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+    } while (n < 0 && errno == EINTR);
+    return n == 0;
+}
+
 INLINE_UNLESS_DEBUG static void
 start_write_watcher(struct feer_conn *c) {
     ASSERT_EV_LOOP_INITIALIZED();
@@ -1132,7 +1147,26 @@ try_conn_write(EV_P_ struct ev_io *w, int revents)
             call_poll_callback(c, 1);
 
         // callback didn't write anything:
-        if (unlikely(!c->wbuf_rinq)) goto try_write_again;
+        if (unlikely(!c->wbuf_rinq)) {
+            /* Re-arming a level-triggered EV_WRITE on a drained, always
+             * writable socket means this fires again immediately, so a
+             * callback that keeps declining spins at ~1M calls/sec on one
+             * core.  Whether that re-invitation should happen at all is a
+             * contract question (the POD says the callback fires when the
+             * buffer DRAINS, which is one event, not a continuous state) and
+             * is left alone here.  What is not a question: the read watcher
+             * was stopped when the request completed and writev never runs on
+             * an empty buffer, so nothing ever notices the peer has gone -
+             * the spin continued at full rate on a closed connection,
+             * forever.  Look, cheaply, and only on this already-pathological
+             * path. */
+            if (unlikely(peer_is_gone(c))) {
+                trace("poll_cb produced nothing and the peer is gone %d\n", w->fd);
+                change_responding_state(c, RESPOND_SHUTDOWN);
+                goto try_write_finished;
+            }
+            goto try_write_again;
+        }
     }
     // Low-water-mark: buffer not empty but below threshold - refill before writing
     else if (c->cached_wbuf_low_water > 0
