@@ -301,6 +301,30 @@ Feersum adds these extensions (see below for info)
 Note that SCRIPT_NAME is always blank (but defined).  PATH_INFO will contain
 the path part of the requested URI.
 
+B<PATH_INFO is fully percent-decoded, so sanitise it before using it as a
+filename.>  Feersum decodes the escapes and does nothing else to the result:
+
+    /a/%2e%2e%2fsecret   ->  /a/../secret     (a live traversal, not collapsed)
+    /a%2Fb               ->  /a/b             (a separator that was not one)
+    /a%00b               ->  /a\0b            (an embedded NUL)
+
+The C<..> is the one to guard: nothing here collapses it, so a route that
+appends PATH_INFO to a document root escapes that root.  C<%2F> matters for
+the opposite reason - a path that arrives as one segment becomes two, so a
+rule that counts or splits segments sees a different shape than the client
+sent.  The NUL is the mildest: Perl's own C<open> refuses a pathname
+containing one (it warns and fails rather than truncating), but the byte still
+travels into anything else you hand it to - a log line, a database query, an
+C<exec>, a downstream service.
+
+Match against a whitelist rather than pattern-matching the tail, and reject a
+decoded path containing a C<..> segment or a NUL.  This leniency is what
+L<Starman> and the rest of the ecosystem do too - none of them sanitise
+either, though Starman truncates at a NUL where Feersum keeps the whole
+string.  The raw, undecoded target is always in C<REQUEST_URI> if you would
+rather decode it yourself, and QUERY_STRING is B<not> decoded, as PSGI
+requires.
+
 B<Over HTTP/1.x, Feersum only accepts these request methods:> GET, HEAD, POST,
 PUT, PATCH, DELETE, OPTIONS.  Anything else, C<CONNECT> included, is
 answered with C<405 Method Not Allowed> and an C<Allow> header, without the
