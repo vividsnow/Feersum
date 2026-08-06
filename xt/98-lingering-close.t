@@ -1,30 +1,22 @@
 #!perl
-# KNOWN ISSUE, documented rather than fixed - see the TODO block below.
+# Lingering close regression test.
 #
-# Every close path treats "user-space buffers empty" as "delivered".  An empty
-# wbuf_rinq (or tls_wbuf) only means the KERNEL send buffer accepted the
-# bytes; megabytes can still be in flight.  close() then orphans the socket,
-# and any byte arriving afterwards makes the kernel answer RST, which discards
-# the queued response at BOTH ends.  There is no lingering close.
+# "User-space buffers empty" is not "delivered": an empty wbuf_rinq only
+# means the KERNEL send buffer accepted the bytes, and an autotuned buffer
+# can hold megabytes in flight.  A bare close() there orphans the socket, and
+# a byte arriving afterwards - an HTTP/1.1 client pipelining its next request,
+# or one speculatively writing on a connection it believes is reusable - makes
+# the kernel answer RST, which discards the queued response at BOTH ends.
 #
-# A client only has to say something while reading - which is ordinary: an
-# HTTP/1.1 client pipelining its next request, or one speculatively writing on
-# what it believes is a reusable connection.  keepalive is off by default, so
-# every response is a close-response and every such client is exposed.
-#
-# Measured on a 4MB response with keepalive off:
+# Measured on a 4MB response with keepalive off (the default, so every
+# response is a close-response):
 #   client silent          -> 4194304 bytes, clean EOF
-#   client sends one byte  -> 1785735 bytes, "Connection reset by peer",
-#                             three runs, identical truncation point
+#   client sends one byte  -> 1785735 bytes, "Connection reset by peer"
 #
-# The fix is a lingering close (shutdown(SHUT_WR), drain the read side to EOF
-# under a bound, then close) as nginx and Apache both implement.  It is not
-# applied here because it interacts with TLS close_notify, the graceful
-# shutdown drain, max_connections accounting and fd pressure, and wants to be
-# done deliberately rather than late in a release.
-#
-# This test is TODO so it does not fail the suite, but it will announce itself
-# the moment the behaviour is fixed.
+# The fix is a bounded lingering close: shutdown(SHUT_WR) queues FIN behind
+# the buffered response, then the read side drains to peer EOF, a 256KB byte
+# cap, or the linger_timeout deadline, whichever comes first.  The poked
+# client's byte is absorbed by the drain instead of answered with RST.
 use warnings;
 use strict;
 use constant TIMEOUT_MULT =>
@@ -56,6 +48,11 @@ if (!$server) {
     # keepalive off is the default, so this is a close-response.
     $f->read_timeout(60 * TIMEOUT_MULT);
     $f->header_timeout(60 * TIMEOUT_MULT);
+    # Explicit and generous: on a fast machine the kernel swallows the whole
+    # response at once, so the stray byte lands inside the linger window
+    # rather than in the receive queue at linger start.  30s (nginx's own
+    # lingering_time default) keeps slow/loaded CI well inside the window.
+    $f->linger_timeout(30 * TIMEOUT_MULT);
     $f->psgi_request_handler(sub {
         my $b = 'Z' x $SIZE;
         return [200, ['Content-Type' => 'application/octet-stream',
@@ -105,13 +102,8 @@ is $silent, $SIZE,
     "a silent client receives the whole $SIZE-byte response (got $silent)";
 
 my $poked = fetch(1);
-TODO: {
-    local $TODO = 'no lingering close: a byte arriving after close() makes '
-                . 'the kernel RST and discard the response still in its send '
-                . 'buffer';
-    is $poked, $SIZE,
-        "a client that sends one byte mid-download still receives the whole "
-      . "response (got $poked)";
-}
+is $poked, $SIZE,
+    "a client that sends one byte mid-download still receives the whole "
+  . "response (got $poked)";
 
 reap_server($server);

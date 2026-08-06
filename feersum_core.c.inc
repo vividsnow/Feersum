@@ -575,6 +575,7 @@ init_feer_server (struct feer_server *s)
     s->read_timeout = READ_TIMEOUT;
     s->header_timeout = HEADER_TIMEOUT;
     s->write_timeout = WRITE_TIMEOUT;
+    s->linger_timeout = LINGER_TIMEOUT;
     s->max_accept_per_loop = DEFAULT_MAX_ACCEPT_PER_LOOP;
     s->max_connections = 10000;
     s->max_read_buf = MAX_READ_BUF;
@@ -838,6 +839,157 @@ feer_server_recycle_idle_conn(struct feer_server *srvr)
 }
 
 
+/* ------------------------- lingering close ------------------------- */
+
+/* An empty wbuf_rinq means the KERNEL send buffer accepted the bytes, not
+ * that the peer received them; an autotuned buffer can hold megabytes in
+ * flight.  A bare close() orphans the socket, and any byte arriving
+ * afterwards - a pipelined next request, a speculative write on a connection
+ * the client believes reusable - makes the kernel answer RST, discarding the
+ * queued response at BOTH ends.  (Unread received data makes close() itself
+ * send RST, so draining before close is not sufficient either: the byte
+ * typically arrives AFTER close, at the orphan.)  The remedy is nginx's and
+ * Apache's lingering close: shutdown(SHUT_WR) so FIN queues behind the
+ * buffered response, then keep reading and discarding until the peer EOFs, a
+ * byte cap is exceeded, or a hard deadline fires.  The fd and the
+ * max_connections slot are held for the duration, which is why the bounds
+ * are tight and why the shutdown/eviction paths below do not linger. */
+
+static void
+linger_read_cb(EV_P_ ev_io *w, int revents)
+{
+    dCONN;
+    char buf[8192];
+    ssize_t n;
+
+    SvREFCNT_inc_void_NN(c->self);
+
+    if (unlikely(revents & EV_ERROR && !(revents & EV_READ))) {
+        trace("linger read EV error fd=%d revents=0x%08x\n", w->fd, revents);
+        feer_shutdown_conn(c, "linger EV error");
+        goto linger_out;
+    }
+
+    do {
+        n = read(w->fd, buf, sizeof(buf));
+    } while (n < 0 && errno == EINTR);
+
+    if (likely(n > 0)) {
+        c->linger_left = ((size_t)n < c->linger_left)
+                       ? c->linger_left - (size_t)n : 0;
+        trace("linger drained fd=%d left=%"Sz_uf"\n", w->fd, (Sz)c->linger_left);
+        if (likely(c->linger_left > 0))
+            goto linger_out;   /* within the byte budget: keep draining */
+        /* A peer flooding past the cap forfeits the linger. */
+        feer_shutdown_conn(c, "linger byte cap");
+    }
+    else if (n == 0) {
+        feer_shutdown_conn(c, "linger peer EOF");  /* the ordinary end */
+    }
+    else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        feer_shutdown_conn(c, "linger read error");
+    }
+linger_out:
+    SvREFCNT_dec(c->self);
+}
+
+static void
+linger_timeout_cb(EV_P_ ev_timer *w, int revents)
+{
+    dCONN;
+    SvREFCNT_inc_void_NN(c->self);
+
+    if (unlikely(revents & EV_ERROR))
+        trouble("EV error on linger timer, fd=%d revents=0x%08x\n",
+                c->fd, revents);
+
+    trace("linger deadline fd=%d\n", c->fd);
+    feer_shutdown_conn(c, "linger deadline");
+    /* One-shot timer: libev auto-stopped it before running this callback, so
+     * feer_shutdown_conn's stop_read_timer released nothing - balance the
+     * ev_timer_start reference here. */
+    SvREFCNT_dec(c->self);
+
+    SvREFCNT_dec(c->self);  /* protection */
+}
+
+/* Close via a bounded linger when the connection is eligible, else the
+ * immediate teardown.  Eligible: a plain HTTP/1.x connection whose work is
+ * complete (a close-response fully flushed into the kernel, or an idle
+ * keepalive reap) while the server is not draining for shutdown.
+ *
+ * - TLS stays immediate: safe_close_conn writes close_notify and drops the
+ *   fd in one go; inserting a drain phase between the alert and close()
+ *   changes the TLS shutdown shape for no verified win in this pass.
+ * - H2 keeps its GOAWAY-then-close sequence; pseudo-conns own no fd.
+ * - graceful_shutdown excludes itself: lingering would hold active_conns
+ *   (and max_connections slots) past the response, stalling the drain by up
+ *   to linger_timeout per connection.  max_connections eviction likewise
+ *   closes immediately: it ran precisely to free a slot.
+ * - wbuf_rinq/sendfile non-empty (write-timeout teardown) means the response
+ *   is NOT flushed: nothing to protect, and the peer is demonstrably wedged.
+ * - RESPOND_NORMAL/STREAMING with an empty buffer is a response still in
+ *   progress; shutdown(SHUT_WR) there would truncate it. */
+static void
+feer_linger_close(struct feer_conn *c, const char *where)
+{
+    if (likely(c->fd >= 0)
+        && c->server->linger_timeout > 0.0
+        && !c->server->shutting_down
+        && !c->closing_linger
+        && !c->wbuf_rinq
+        && (c->responding == RESPOND_SHUTDOWN
+            || c->responding == RESPOND_NOT_STARTED)
+#ifdef __linux__
+        && c->sendfile_fd < 0
+#endif
+#ifdef FEERSUM_HAS_TLS
+        && !c->tls
+#endif
+#ifdef FEERSUM_HAS_H2
+        && !c->h2_session && !c->is_h2_stream
+#endif
+    ) {
+        trace("linger begin fd=%d (%s)\n", c->fd, where);
+        /* FIN queues behind the buffered response: the peer sees EOF only
+         * after every queued byte.  fd_given_away conns have c->fd < 0, so
+         * the check above already excludes them. */
+        if (unlikely(shutdown(c->fd, SHUT_WR) < 0 && errno != ENOTCONN))
+            trace("linger shutdown fd=%d: %s\n", c->fd, strerror(errno));
+        stop_all_watchers(c);
+        change_responding_state(c, RESPOND_SHUTDOWN);
+        change_receiving_state(c, RECEIVE_SHUTDOWN);
+        c->closing_linger = 1;
+        c->linger_left = LINGER_MAX_BYTES;
+        ev_io_init(&c->read_ev_io, linger_read_cb, c->fd, EV_READ);
+        ev_set_priority(&c->read_ev_io, c->server->read_priority);
+        c->read_ev_io.data = (void *)c;
+        start_read_watcher(c);
+        ev_timer_init(&c->read_ev_timer, linger_timeout_cb,
+                      c->server->linger_timeout, 0.0);
+        ev_set_priority(&c->read_ev_timer, c->server->read_priority);
+        c->read_ev_timer.data = (void *)c;
+        ev_timer_start(feersum_ev_loop, &c->read_ev_timer);
+        SvREFCNT_inc_void_NN(c->self);
+        /* The response is complete at the wire (data + FIN queued), so the
+         * request is over for the app: fire its response_guard now.
+         * response_guard is documented as a cheap write-completion callback;
+         * holding it to the end of a courtesy drain would pin app resources
+         * for up to linger_timeout on every close-response.  DESTROY's own
+         * dec is NULL-safe. */
+        SvREFCNT_dec(c->ext_guard);
+        c->ext_guard = NULL;
+        /* Join the idle list: nothing is in flight that a close can hurt, so
+         * capacity pressure (max_connections eviction) and the graceful
+         * shutdown sweep may reap the connection early rather than wait out
+         * the drain.  Recycle's feer_shutdown_conn is exactly the linger
+         * teardown, and DESTROY's feer_conn_set_busy unlinks the node. */
+        feer_conn_set_idle(c);
+        return;
+    }
+    feer_shutdown_conn(c, where);
+}
+
 static void
 process_request_ready_rinq (struct feer_server *server)
 {
@@ -1090,12 +1242,14 @@ handle_keepalive_or_close(struct feer_conn *c, conn_read_cb_t read_cb)
         restart_header_timer(c);
         feer_conn_set_idle(c);
     } else {
-        /* feer_shutdown_conn, not a bare safe_close_conn: the read watcher can
+        /* feer_linger_close, not a bare safe_close_conn: the read watcher can
          * still be armed here (an app that set a reader poll_cb starts it and
          * nothing else stops it).  Closing the fd underneath a live watcher
          * leaves it registered - it keeps its reference on c->self, fires on
-         * the torn-down connection, and the conn is never freed or recycled. */
-        feer_shutdown_conn(c, "close at write shutdown");
+         * the torn-down connection, and the conn is never freed or recycled.
+         * feer_linger_close stops all watchers before re-arming its own, and
+         * falls back to feer_shutdown_conn for ineligible connections. */
+        feer_linger_close(c, "close at write shutdown");
     }
 }
 

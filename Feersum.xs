@@ -408,6 +408,23 @@ write_timeout (struct feer_server *server, ...)
     OUTPUT:
         RETVAL
 
+double
+linger_timeout (struct feer_server *server, ...)
+    PROTOTYPE: $;$
+    CODE:
+{
+    if (items > 1) {
+        double val = SvNV(ST(1));
+        if (val < 0.0)
+            croak("linger_timeout must be non-negative (0 to disable)");
+        trace("set linger_timeout %f\n", val);
+        server->linger_timeout = val;
+    }
+    RETVAL = server->linger_timeout;
+}
+    OUTPUT:
+        RETVAL
+
 void
 set_keepalive (struct feer_server *server, SV *set)
     PPCODE:

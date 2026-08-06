@@ -82,6 +82,13 @@
 #define READ_TIMEOUT 5.0
 #define HEADER_TIMEOUT 10.0
 #define WRITE_TIMEOUT 0.0
+/* Lingering close: after a close-response is flushed into the kernel send
+ * buffer, half-close (FIN queued behind the data) and keep draining the read
+ * side so a late/pipelined client byte is absorbed instead of answered with
+ * RST (which would discard the in-flight response at BOTH ends).  Hard bounds:
+ * LINGER_TIMEOUT seconds total, LINGER_MAX_BYTES drained. */
+#define LINGER_TIMEOUT 5.0
+#define LINGER_MAX_BYTES (256 * 1024)
 #define DEFAULT_MAX_ACCEPT_PER_LOOP 64
 #define MAX_PIPELINE_DEPTH 15
 #define FEERSUM_IOMATRIX_SIZE 64
@@ -385,6 +392,9 @@ struct feer_conn {
     unsigned int fd_given_away:1;
     unsigned int proxy_proto_version:2;
     unsigned int proxy_ssl:1;
+    /* In a lingering close: FIN already sent via shutdown(SHUT_WR), read side
+     * is draining to EOF/byte-cap/deadline before the real close(). */
+    unsigned int closing_linger:1;
 
     struct ev_io read_ev_io;
     struct ev_io write_ev_io;
@@ -412,6 +422,9 @@ struct feer_conn {
     int sendfile_fd;
     off_t sendfile_off;
     size_t sendfile_remain;
+
+    /* Bytes a lingering close may still drain before the cap forces close. */
+    size_t linger_left;
 
     uint16_t proxy_dst_port;
     struct rinq *idle_rinq_node;
@@ -526,6 +539,7 @@ struct feer_server {
     double       read_timeout;
     double       header_timeout;
     double       write_timeout;
+    double       linger_timeout;
     unsigned int max_connection_reqs;
     bool         is_keepalive;
     int          read_priority;
@@ -736,6 +750,7 @@ static feer_conn_handle * sv_2feer_conn_handle (SV *rv, bool can_croak);
 static void handle_keepalive_or_close(struct feer_conn *c, conn_read_cb_t read_cb);
 static void feer_emit_access_log(pTHX_ struct feer_conn *c);
 static void safe_close_conn(struct feer_conn *c, const char *where);
+static void feer_linger_close(struct feer_conn *c, const char *where);
 static int prep_socket(int fd, int is_tcp);
 static void set_cork(struct feer_conn *c, int cork);
 static void feersum_init_psgi_env_constants(pTHX);

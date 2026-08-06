@@ -424,10 +424,10 @@ C<1> either way.
 
 The streaming responder has a C<response_guard()> method that can be used to
 attach a guard to the request.  When the request completes (all data has been
-written to the socket and the socket has been closed) the guard will trigger.
-This is an alternate means to doing a "write completion" callback via
-C<poll_cb()> that should be more efficient.  An analogy is the "on_drain"
-handler in L<AnyEvent::Handle>.
+written to the socket and the connection has started its close) the guard
+will trigger.  This is an alternate means to doing a "write completion"
+callback via C<poll_cb()> that should be more efficient.  An analogy is the
+"on_drain" handler in L<AnyEvent::Handle>.
 
 A "guard" in this context is some object that will do something interesting in
 its DESTROY/DEMOLISH method. For example, L<Guard>.
@@ -1197,6 +1197,33 @@ long-lived HTTP/2 stream that has not written at all is unaffected, so
 open-and-wait works, but an SSE or long-poll application that pushes an event
 and then goes quiet needs C<write_timeout> either left at 0 or set above its
 own heartbeat interval.
+
+=item C<< linger_timeout() >>
+
+=item C<< linger_timeout($seconds) >>
+
+Get or set the lingering-close deadline.  Default is 5 seconds; set to 0 to
+disable lingering entirely.
+
+An empty write buffer means the kernel send buffer accepted the response, not
+that the client received it - megabytes can still be in flight.  A plain
+C<close()> at that point orphans the socket, and any byte arriving afterwards
+(a pipelined next request, a speculative write on a connection the client
+believes is reusable) makes the kernel answer RST, which discards the queued
+response at both ends.  So, like nginx and Apache, a completed HTTP/1.x
+close-response instead performs a lingering close: C<shutdown(SHUT_WR)> queues
+FIN behind the buffered response, and the server keeps reading and discarding
+until the peer closes, 256 KB have been drained, or this many seconds have
+passed - whichever comes first.  Error responses (including 413 replies to a
+client still uploading) and idle keepalive reaps linger the same way; TLS
+connections, HTTP/2 connections, write-timeout teardowns, and connections
+closed during a graceful shutdown or by C<max_connections> eviction close
+immediately as before.
+
+A lingering connection holds its file descriptor and its C<max_connections>
+slot for at most this long, which is why the default is much shorter than
+nginx's 30 seconds: with keepalive disabled every response is a
+close-response, so every connection pays it.
 
 =item C<< wbuf_low_water() >>
 

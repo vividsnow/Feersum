@@ -332,7 +332,14 @@ conn_read_timeout (EV_P_ ev_timer *w, int revents)
         respond_with_server_error(c, msg, 408);
     } else {
         trace("read timeout in keepalive conn: %d\n", c->fd);
-        feer_shutdown_conn(c, "close at read timeout");
+        /* Idle keepalive reap: nothing is wrong, the client simply went quiet
+         * - it may still be reading the previous response out of the kernel
+         * and pipeline its next request onto this connection at any moment.
+         * Linger (bounded) so that late request is absorbed rather than
+         * answered with an RST that discards the previous response's tail.
+         * Ineligible states (streaming, mid-response) fall through to the
+         * immediate close inside feer_linger_close. */
+        feer_linger_close(c, "close at read timeout");
         change_receiving_state(c, RECEIVE_SHUTDOWN);
     }
 
