@@ -24,7 +24,17 @@ Revision history for Perl extension Feersum
         - requires Perl 5.14+ (was 5.8.7)
         - Feersum object is no longer a hashref (use public API)
         - psgi.input always valid (PSGI 1.1 compliant)
-        - response header/status-line CRLF injection rejected (CWE-113)
+        - response header/status-line CRLF injection rejected (CWE-113); also
+          NUL and other control characters, empty header names, and names
+          containing or starting with a space
+        - a 1xx as a final response status is rejected (it is interim, so the
+          client misattributed every later response on the connection); 101
+          stays legal.  A status above 599 now answers 500 on HTTP/1.x, as it
+          already did on HTTP/2
+        - $r->read($buf, $len, $offset) no longer corrupts the heap when $len
+          is negative (it could abort the whole server)
+        - $w->write(substr($x, ...)) and send_response(..., substr($x, ...))
+          no longer silently write nothing
         - psgi.input close() no longer breaks keepalive or discards an
           already-pipelined next request
         - an http/1.0 keep-alive client that pipelines into one segment now
