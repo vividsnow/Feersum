@@ -35,6 +35,10 @@ Revision history for Perl extension Feersum
           is negative (it could abort the whole server)
         - $w->write(substr($x, ...)) and send_response(..., substr($x, ...))
           no longer silently write nothing
+        - a psgi.input poll_cb that dies now costs that one request (500)
+          instead of killing the server process
+        - a graceful_shutdown or worker-retirement callback that dies is
+          reported instead of silently leaving the server half-shut-down
         - psgi.input close() no longer breaks keepalive or discards an
           already-pipelined next request
         - an http/1.0 keep-alive client that pipelines into one segment now
