@@ -161,6 +161,7 @@ t/157-tls-tunnel-ordering.t
 t/158-h2-tunnel-ordering.t
 t/159-h2-slow-response-read-deadline.t
 t/16-req.t
+t/160-tls-max-read-buf-parity.t
 t/17-priority.t
 t/18-epoll-exclusive.t
 t/19-runner-validation.t
