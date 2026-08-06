@@ -533,9 +533,13 @@ read_priority (struct feer_server *server, ...)
                : ix == 1 ? &server->write_priority
                :           &server->read_priority;
     if (items > 1) {
-        int new_priority = SvIV(ST(1));
-        if (new_priority < EV_MINPRI) new_priority = EV_MINPRI;
-        if (new_priority > EV_MAXPRI) new_priority = EV_MAXPRI;
+        /* Clamp on the NV.  Narrowing SvIV to int wrapped first, so asking
+         * for the highest priority could land on the lowest.  The leading
+         * !(> ) also sends NaN to EV_MINPRI instead of undefined behaviour. */
+        NV want = SvNV(ST(1));
+        int new_priority = !(want > (NV)EV_MINPRI) ? EV_MINPRI
+                         : want >= (NV)EV_MAXPRI   ? EV_MAXPRI
+                         :                           (int)want;
         trace("set %s_priority %d\n", names[ix], new_priority);
         *field = new_priority;
     }
@@ -550,13 +554,13 @@ max_accept_per_loop (struct feer_server *server, ...)
     CODE:
 {
     if (items > 1) {
-        /* Range-check before narrowing, as max_connections does: truncating
-         * first made anything >= 2^31 negative, so asking for the largest
-         * possible batch clamped to 1 - the smallest. */
-        IV want = SvIV(ST(1));
-        int new_max = want < 1 ? 1
-                    : want > INT_MAX ? INT_MAX
-                    : (int)want;
+        /* Range-check on the NV, not the IV: SvIV saturates to IV_MIN at 2^63
+         * and to -1 beyond UV range, so an IV check only moved the cliff -
+         * asking for the largest batch still clamped to 1, the smallest. */
+        NV want = SvNV(ST(1));
+        int new_max = !(want >= 1)        ? 1        /* also catches NaN */
+                    : want >= (NV)INT_MAX ? INT_MAX
+                    :                       (int)want;
         trace("set max_accept_per_loop %d\n", new_max);
         server->max_accept_per_loop = new_max;
     }
@@ -578,13 +582,13 @@ max_connections (struct feer_server *server, ...)
     CODE:
 {
     if (items > 1) {
-        /* Range-check the IV before narrowing: truncating first turned any
-         * value >= 2^31 negative, which this then read as 0 = unlimited -
-         * a cap silently becoming no cap. */
-        IV want = SvIV(ST(1));
-        int new_max = want < 0 ? 0             // 0 means unlimited
-                    : want > INT_MAX ? INT_MAX
-                    : (int)want;
+        /* Range-check on the NV, not the IV: SvIV saturates to IV_MIN at 2^63
+         * and to -1 beyond UV range, so an IV check only moved the point at
+         * which a cap silently became no cap. */
+        NV want = SvNV(ST(1));
+        int new_max = !(want > 0)         ? 0        /* <= 0, or NaN: unlimited */
+                    : want >= (NV)INT_MAX ? INT_MAX
+                    :                       (int)want;
         trace("set max_connections %d\n", new_max);
         server->max_connections = new_max;
     }
@@ -681,11 +685,16 @@ max_h2_concurrent_streams (struct feer_server *server, ...)
 {
 #ifdef FEERSUM_HAS_H2
     if (items > 1) {
-        int n = SvIV(ST(1));
-        if (n < 1) n = 1;
-        /* Capped at FEER_H2_MAX_CONCURRENT_STREAMS because the poll-callback
-         * scan in h2_check_stream_poll_cbs uses a fixed-size stack array. */
-        if (n > FEER_H2_MAX_CONCURRENT_STREAMS) n = FEER_H2_MAX_CONCURRENT_STREAMS;
+        /* Clamp on the NV: narrowing SvIV to int wrapped first, so a large
+         * value advertised MAX_CONCURRENT_STREAMS=1 - serialising the very
+         * clients the operator was trying to let run in parallel.  Capped at
+         * FEER_H2_MAX_CONCURRENT_STREAMS because the poll-callback scan in
+         * h2_check_stream_poll_cbs uses a fixed-size stack array. */
+        NV want = SvNV(ST(1));
+        int n = !(want >= 1) ? 1        /* also catches NaN */
+              : want >= (NV)FEER_H2_MAX_CONCURRENT_STREAMS
+                    ? FEER_H2_MAX_CONCURRENT_STREAMS
+              : (int)want;
         server->max_h2_concurrent_streams = n;
     }
     RETVAL = server->max_h2_concurrent_streams;
@@ -712,13 +721,13 @@ max_connection_reqs (struct feer_server *server, ...)
     CODE:
 {
     if (items > 1) {
-        IV n = SvIV(ST(1));
-        if (n < 0)
+        /* Clamp on the NV: SvIV saturates to IV_MIN at 2^63 and to -1 beyond
+         * UV range, so a large positive limit was rejected as "negative".
+         * !(>= 0) also catches NaN, as read_timeout does. */
+        NV want = SvNV(ST(1));
+        if (!(want >= 0.0))
             croak("max_connection_reqs must be non-negative (0 for unlimited)");
-        /* Clamp instead of narrowing: >= 2^32 truncated to 0 = unlimited.
-         * Compare as UV: (IV)UINT_MAX is -1 where IV is 32 bits, which made
-         * every non-negative input compare greater and store UINT_MAX. */
-        unsigned int reqs = ((UV)n > (UV)UINT_MAX) ? UINT_MAX : (unsigned int)n;
+        unsigned int reqs = want >= (NV)UINT_MAX ? UINT_MAX : (unsigned int)want;
         trace("set max requests per connection %u\n", reqs);
         server->max_connection_reqs = reqs;
     }
