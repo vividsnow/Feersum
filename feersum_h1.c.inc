@@ -398,6 +398,19 @@ conn_write_timeout (EV_P_ ev_timer *w, int revents)
         goto write_timeout_cleanup;
     }
 
+    /* Paced re-invitation of a declining poll_cb, not a deadline.  Stop the
+     * timer first: repeat > 0 means ev_timer_again made it periodic, and the
+     * next park (if the app declines again) arms a fresh, longer one. */
+    if (unlikely(c->poll_retry_pending)) {
+        c->poll_retry_pending = 0;
+        if (likely(ev_is_active(w))) {
+            ev_timer_stop(feersum_ev_loop, w);
+            SvREFCNT_dec(c->self);
+        }
+        trace("poll retry %d\n", c->fd);
+        conn_write_ready(c);
+        goto write_timeout_cleanup;
+    }
 
     trace("write timeout %d\n", c->fd);
     feer_shutdown_conn(c, "write timeout");

@@ -100,6 +100,20 @@ h2_stream_write_timeout(EV_P_ ev_timer *w, int revents)
         goto h2_wt_cleanup;
     }
 
+    /* Paced re-invitation of a declining poll_cb (see conn_write_timeout's
+     * twin): stop the periodic retry, then run the pump, which re-parks with
+     * a longer interval if the app declines again. */
+    if (unlikely(c->poll_retry_pending)) {
+        c->poll_retry_pending = 0;
+        if (likely(ev_is_active(w))) {
+            ev_timer_stop(feersum_ev_loop, w);
+            SvREFCNT_dec(c->self);
+        }
+        trace("H2 poll retry pc=%p\n", c);
+        conn_write_ready(c);   /* pseudo-conn: dispatches h2_try_stream_write */
+        goto h2_wt_cleanup;
+    }
+
     struct feer_h2_stream *stream = H2_STREAM_FROM_PC(c);
     stop_write_timer(c);
 
@@ -1615,6 +1629,7 @@ h2_try_stream_write(pTHX_ struct feer_conn *c)
 
     int iters = 0;
     int budget_spent = 0;
+    int declined = 0;
     while (c->responding == RESPOND_STREAMING && c->poll_write_cb) {
         if (iters++ >= 64) { budget_spent = 1; break; }
         STRLEN avail = h2_resp_wbuf_avail(stream);
@@ -1639,8 +1654,10 @@ h2_try_stream_write(pTHX_ struct feer_conn *c)
          * running dry: breaking there stalled the response for good, since
          * nothing else re-invites the callback.  Only stop when the app did
          * not write at all. */
-        if (after == before && stream->writes_seen == writes_before)
+        if (after == before && stream->writes_seen == writes_before) {
+            declined = 1;
             break;
+        }
         /* The app wrote but produced nothing.  That is the shape that can spin
          * this pump forever, so put a deadline on it - here rather than at
          * start_response, because a stream that has simply not written yet is
@@ -1678,6 +1695,18 @@ h2_try_stream_write(pTHX_ struct feer_conn *c)
             st->parent->h2_pump_pending = 1;
             start_write_watcher(st->parent);
         }
+    }
+    /* A pure decline used to stall the stream until the peer happened to send
+     * a frame - the same contract hole H1 answered by spinning.  Both now get
+     * the paced re-invitation; the timer lands in h2_stream_write_timeout,
+     * whose retry branch re-enters this pump.  Only with an EMPTY stream
+     * buffer, though: a sub-low-water tail keeps its write deadline and is
+     * re-invited by the peer's WINDOW_UPDATEs as before. */
+    else if (unlikely(declined) && c->responding == RESPOND_STREAMING
+             && c->poll_write_cb) {
+        struct feer_h2_stream *st = H2_STREAM_FROM_PC(c);
+        if (st && st->parent && h2_resp_wbuf_avail(st) == 0)
+            feersum_poll_retry_park(c);
     }
 
     SvREFCNT_dec(c->self);

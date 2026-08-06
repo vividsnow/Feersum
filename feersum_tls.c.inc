@@ -1397,10 +1397,34 @@ tls_write_finished:
         if (c->responding == RESPOND_SHUTDOWN || c->responding == RESPOND_NORMAL) {
             handle_keepalive_or_close(c, try_tls_conn_read);
         } else if (c->responding == RESPOND_STREAMING && c->poll_write_cb) {
+            unsigned int writes_before = c->poll_writes_seen;
             if (c->poll_write_cb_is_io_handle)
                 pump_io_handle(c);
             else
                 call_poll_callback(c, 1 /* is_write */);
+            /* Pure decline: park and pace, exactly as the plain path does in
+             * try_conn_write.  The level-triggered spin was identical here,
+             * and this path never had any peer-gone detection at all. */
+            if (!c->wbuf_rinq && c->tls_wbuf.off == 0
+                && c->responding == RESPOND_STREAMING && c->poll_write_cb
+                && c->poll_writes_seen == writes_before) {
+                if (unlikely(peer_is_gone(c))) {
+                    trace("TLS poll_cb declined and the peer is gone %d\n", c->fd);
+                    feer_shutdown_conn(c, "poll_cb decline, peer gone");
+                }
+                else
+                    feersum_poll_retry_park(c);
+            }
+            else {
+                /* The callback produced output or advanced the response.
+                 * When the always-armed watcher WAS the pump (pre-park), the
+                 * next level-triggered pass flushed it; a paced-retry entry
+                 * has no watcher armed, and pump_io_handle in particular
+                 * buffers (data or the EOF terminator) without arming
+                 * anything - that stranded a chunked tail.  No-op if the
+                 * callback's own write already armed it. */
+                start_write_watcher(c);
+            }
         } else if (c->responding == RESPOND_STREAMING) {
             stop_write_watcher(c);
             stop_write_timer(c);

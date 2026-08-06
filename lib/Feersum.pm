@@ -849,6 +849,15 @@ and B<not reported anywhere> (the handler is called with G_EVAL).  A handler
 that dies is therefore silent.  The server will still respond with a 500 error
 to the client.
 
+The 500 can only be sent while the response has not started.  A handler (or
+PSGI streaming callback) that dies B<mid-stream> instead has its response
+sealed so the client can detect the truncation: HTTP/1.x closes the
+connection without the terminating chunk, HTTP/2 sends C<RST_STREAM>.  A
+response explicitly completed with C<< $w->close >> before the die is
+delivered intact; merely letting the writer go out of scope does not count
+as completion when the same callback then dies, since that drop is exactly
+what an exception unwind looks like.
+
 =item C<< set_server_name_and_port($host,$port) >>
 
 Override Feersum's notion of what SERVER_NAME and SERVER_PORT should be.

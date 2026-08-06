@@ -125,6 +125,29 @@ Revision history for Perl extension Feersum
           this body. reachable from an empty $w->write() or a PSGI IO-handle
           body whose getline returns an empty string between chunks. the TLS
           path already skipped zero-length iovecs, so the two disagreed
+        - an app dying inside a streaming callback produced a response no
+          client could tell from a complete one: the die unwound the writer
+          before the error was caught, and the writer's destructor is the
+          ordinary clean-completion path, so http/1 still sent the terminating
+          chunk and http/2 set END_STREAM on a truncated body. the writer is
+          now held across the callback and a mid-stream die seals the response
+          dirty instead: http/1 closes without the terminator, http/2 sends
+          RST_STREAM. a response close()d before the die, a writer the app
+          still holds, and $@ left over from a caught inner eval are all
+          unaffected
+        - a write poll_cb that declined an invitation (returned without
+          writing) was re-invited by the level-triggered write watcher every
+          loop iteration: ~1M calls/sec, a full core, on plain and TLS; the
+          http/2 pump had the opposite defect and stalled such a stream until
+          the peer happened to send a frame. all transports now agree: a
+          decline parks the response and re-invites on a paced backoff (1ms
+          doubling to 100ms, reset by progress), a write from any other event
+          still resumes immediately, and an empty write() still requests an
+          immediate re-invitation. a parked response has no write deadline,
+          matching the long-poll rule, and a vanished client is noticed at
+          the next paced retry (on TLS only when the close was abrupt; a
+          graceful close_notify still waits for the next write, as documented
+          for quiet streams)
         - see the UPGRADING section in the Feersum docs for behaviour changes
           since 1.505 that need no code change to bite
 

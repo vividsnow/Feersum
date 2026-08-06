@@ -1376,21 +1376,53 @@ call_died (pTHX_ struct feer_conn *c, const char *cb_type)
     sv_setsv(ERRSV, &PL_sv_undef);
 }
 
+/* Balance the pin new_feer_conn_handle took during a guarded callback.
+ * errored: the callback died (ERRSV was true at the G_EVAL catch, which is
+ * authoritative - the eval clears $@ on success, so an inner caught eval{}
+ * cannot leak in here as a false positive).  If the app dropped every ref to
+ * a still-streaming writer while dying, the drop was the unwind, not a
+ * deliberate completion: seal DIRTY so the truncation is detectable (H1
+ * closes without the terminating chunk; H2 was already RST by call_died).
+ * A writer close()d before the die is already RESPOND_SHUTDOWN and keeps its
+ * clean completion; a writer the app still holds stays usable, as before. */
+static void
+feersum_writer_unpin(pTHX_ struct feer_conn *c, bool errored)
+{
+    SV *pin = c->pinned_writer;
+    if (likely(!pin)) return;
+    c->pinned_writer = NULL;
+    if (unlikely(errored) && SvREFCNT(pin) == 1
+        && c->responding == RESPOND_STREAMING) {
+        trace("callback died mid-stream, sealing dirty fd=%d c=%p\n", c->fd, c);
+        c->is_keepalive = 0;    /* call_died did this too; keep it load-bearing */
+        change_responding_state(c, RESPOND_SHUTDOWN);
+        conn_write_ready(c);    /* flush partial data, then close */
+    }
+    /* No error: if the app dropped its refs, this dec runs the ordinary
+     * DESTROY -> close path and the response completes cleanly as ever. */
+    SvREFCNT_dec(pin);
+}
+
 static void
 feersum_start_psgi_streaming(pTHX_ struct feer_conn *c, SV *streamer)
 {
     dSP;
+    bool errored;
     ENTER;
     SAVETMPS;
     PUSHMARK(SP);
     mXPUSHs(feer_conn_2sv(c));
     XPUSHs(streamer);
     PUTBACK;
+    c->pin_writer = 1;
     call_method("_initiate_streaming_psgi", G_DISCARD|G_EVAL|G_VOID);
+    c->pin_writer = 0;
     SPAGAIN;
-    if (unlikely(SvTRUE(ERRSV))) {
+    errored = SvTRUE(ERRSV) ? TRUE : FALSE;
+    if (unlikely(errored)) {
         call_died(aTHX_ c, "PSGI stream initiator");
     }
+    feersum_writer_unpin(aTHX_ c, errored);
     PUTBACK;
     FREETMPS;
     LEAVE;
@@ -1672,12 +1704,15 @@ call_request_callback (struct feer_conn *c)
     }
 
     PUTBACK;
+    c->pin_writer = 1;
     int returned = call_sv(server->request_cb_cv, flags);
+    c->pin_writer = 0;
     SPAGAIN;
 
     trace("called request callback, errsv? %d\n", SvTRUE(ERRSV) ? 1 : 0);
 
-    if (unlikely(SvTRUE(ERRSV))) {
+    bool req_cb_errored = SvTRUE(ERRSV) ? TRUE : FALSE;
+    if (unlikely(req_cb_errored)) {
         call_died(aTHX_ c, "request");
         // call_sv(G_SCALAR) still pushed a value (undef) before unwinding, and
         // call_died has just run more Perl, so re-fetch SP and drop it.  Simply
@@ -1689,6 +1724,9 @@ call_request_callback (struct feer_conn *c)
         PUTBACK;
         returned = 0;
     }
+    /* Native handlers create their writer inside the call above; decide its
+     * fate now, before the PSGI streamer (which pins its own) can run. */
+    feersum_writer_unpin(aTHX_ c, req_cb_errored);
 
     SV *psgi_response = NULL;
     if (server->request_cb_is_psgi && likely(returned >= 1)) {

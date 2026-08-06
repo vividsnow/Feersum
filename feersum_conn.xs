@@ -160,6 +160,11 @@ write (feer_conn_handle *hdl, ...)
     PROTOTYPE: $;$
     CODE:
 {
+    // The app answered a poll_cb invitation (even with nothing): counted so
+    // the write path can tell engagement from a pure decline.  See
+    // poll_writes_seen in feersum_core.h; mirrors the H2 pump's writes_seen.
+    c->poll_writes_seen++;
+
     // HEAD carries no content, so measure the body and discard it.  Must come
     // before the state check: an H2 no-body response is already completed at
     // start_response, so a delayed handler writing later would croak.
@@ -216,6 +221,8 @@ write_array (feer_conn_handle *hdl, AV *abody)
     PROTOTYPE: $$
     PPCODE:
 {
+    c->poll_writes_seen++;   // see write() above
+
     // See write() above: HEAD must not croak on the state check, because an H2
     // no-body response has already reached RESPOND_SHUTDOWN.
     if (unlikely(c->no_resp_body))
@@ -262,6 +269,8 @@ sendfile (feer_conn_handle *hdl, SV *fh, ...)
     PPCODE:
 {
 #ifdef __linux__
+    c->poll_writes_seen++;   // see write() above
+
     if (h2_is_stream(c))
         croak("sendfile not supported for HTTP/2 streams (use write instead)");
     if (unlikely(c->responding != RESPOND_STREAMING))

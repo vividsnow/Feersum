@@ -89,6 +89,11 @@
  * LINGER_TIMEOUT seconds total, LINGER_MAX_BYTES drained. */
 #define LINGER_TIMEOUT 5.0
 #define LINGER_MAX_BYTES (256 * 1024)
+/* Paced re-invitation of a write poll_cb that declined (wrote nothing):
+ * MIN * 2^backoff, clamped to MAX; backoff capped so the shift stays sane. */
+#define FEER_POLL_RETRY_MIN 0.001
+#define FEER_POLL_RETRY_MAX 0.1
+#define FEER_POLL_RETRY_BACKOFF_CAP 7
 #define DEFAULT_MAX_ACCEPT_PER_LOOP 64
 #define MAX_PIPELINE_DEPTH 15
 #define FEERSUM_IOMATRIX_SIZE 64
@@ -371,6 +376,12 @@ struct feer_conn {
 
     unsigned int in_callback;
     unsigned int pipeline_depth;
+    /* Bumped by every Writer write()/write_array()/sendfile() call, even a
+     * zero-length one.  Compared around a poll_cb invitation to tell a pure
+     * decline (no call at all - park and pace) from an app that engaged but
+     * buffered nothing (stay hot).  Same rule the H2 pump's writes_seen
+     * implements; only change matters, so wraparound is fine. */
+    unsigned int poll_writes_seen;
     unsigned int is_http11:1;
     unsigned int poll_write_cb_is_io_handle:1;
     unsigned int auto_cl:1;
@@ -395,6 +406,15 @@ struct feer_conn {
     /* In a lingering close: FIN already sent via shutdown(SHUT_WR), read side
      * is draining to EOF/byte-cap/deadline before the real close(). */
     unsigned int closing_linger:1;
+    /* Set while the request handler / PSGI streamer runs under its G_EVAL:
+     * tells new_feer_conn_handle to pin the writer it hands out (below). */
+    unsigned int pin_writer:1;
+    /* write_ev_timer is currently armed as a paced poll_cb re-invitation
+     * (feersum_poll_retry_park), not as the write deadline.  Only the park
+     * helper sets it; every site that arms the deadline or stops the timer
+     * clears it, so flag set <=> timer armed for retry. */
+    unsigned int poll_retry_pending:1;
+    unsigned int poll_retry_backoff:4;
 
     struct ev_io read_ev_io;
     struct ev_io write_ev_io;
@@ -407,6 +427,14 @@ struct feer_conn {
     SV *poll_write_cb;
     SV *poll_read_cb;
     SV *ext_guard;
+    /* Extra ref on the writer handle created inside a guarded callback.  A die
+     * there unwinds the app's lexicals BEFORE the G_EVAL catch runs, and the
+     * writer's DESTROY seals the response CLEAN (H1 terminating chunk, H2
+     * END_STREAM) - so the client saw a complete-looking truncated response.
+     * The pin keeps the handle alive across the unwind; feersum_writer_unpin
+     * then seals dirty on error or lets the normal DESTROY seal run.  Always
+     * NULL outside the callback's C stack frame. */
+    SV *pinned_writer;
     /* Captured at dispatch, only when the server has an access_log callback:
      * req->method/uri point into rbuf, which is reused by the next request. */
     SV *log_method;
@@ -680,6 +708,8 @@ static void sched_request_callback(struct feer_conn *c);
 static void invoke_shutdown_cb(pTHX_ struct feer_server *server);
 static void feer_begin_graceful_shutdown(pTHX_ struct feer_server *server, SV *cb);
 static void call_died (pTHX_ struct feer_conn *c, const char *cb_type);
+static void feersum_writer_unpin (pTHX_ struct feer_conn *c, bool errored);
+static void feersum_poll_retry_park (struct feer_conn *c);
 static void call_request_callback(struct feer_conn *c);
 static void call_poll_callback (struct feer_conn *c, bool is_write);
 static void pump_io_handle (struct feer_conn *c);

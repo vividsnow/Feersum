@@ -565,6 +565,13 @@ new_feer_conn_handle (pTHX_ struct feer_conn *c, bool is_writer)
     SvREFCNT_inc_void_NN(c->self);
     sv = newRV_noinc(newSVuv(PTR2UV(c)));
     sv_bless(sv, is_writer ? feer_conn_writer_stash : feer_conn_reader_stash);
+    /* Pin the referent (the blessed SV, whose refcount drives DESTROY) while
+     * the guarded callback runs; see pinned_writer in feersum_core.h.  The
+     * !pinned_writer gate keeps a nested poll_cb's per-invocation handle from
+     * stealing the slot - by the time a poll_cb can fire, the real writer has
+     * already been created and pinned. */
+    if (is_writer && unlikely(c->pin_writer) && !c->pinned_writer)
+        c->pinned_writer = SvREFCNT_inc_NN(SvRV(sv));
     return sv;
 }
 
@@ -714,12 +721,20 @@ stop_write_watcher(struct feer_conn *c) {
 
 INLINE_UNLESS_DEBUG static void
 restart_write_timer(struct feer_conn *c) {
+    /* Progress: the poll-retry backoff resets even with no deadline
+     * configured.  poll_retry_pending is NOT cleared on the early return -
+     * that flag may only change where the timer is stopped or re-armed, or a
+     * short retry repeat would fire as an instant deadline. */
+    c->poll_retry_backoff = 0;
     if (c->cached_write_timeout <= 0.0) return;
     if (likely(!ev_is_active(&c->write_ev_timer))) {
         trace("restart write timer %d\n",c->fd);
-        c->write_ev_timer.repeat = c->cached_write_timeout;
         SvREFCNT_inc_void_NN(c->self);
     }
+    /* Unconditional: the timer may be armed as a poll retry with a short
+     * repeat, which must not survive as the deadline interval. */
+    c->poll_retry_pending = 0;
+    c->write_ev_timer.repeat = c->cached_write_timeout;
     ev_timer_again(feersum_ev_loop, &c->write_ev_timer);
 }
 
@@ -730,20 +745,58 @@ restart_write_timer(struct feer_conn *c) {
 INLINE_UNLESS_DEBUG static void
 ensure_write_timer(struct feer_conn *c) {
     if (c->cached_write_timeout <= 0.0) return;
-    if (ev_is_active(&c->write_ev_timer)) return;
+    /* Already armed as the deadline: leave it, that is the point of ensure.
+     * Armed as a poll retry: the deadline takes the timer back - data is
+     * pending now and the short retry repeat must not linger. */
+    if (ev_is_active(&c->write_ev_timer) && likely(!c->poll_retry_pending))
+        return;
     trace("arm write timer %d\n",c->fd);
+    if (likely(!ev_is_active(&c->write_ev_timer)))
+        SvREFCNT_inc_void_NN(c->self);
+    c->poll_retry_pending = 0;
+    c->poll_retry_backoff = 0;
     c->write_ev_timer.repeat = c->cached_write_timeout;
-    SvREFCNT_inc_void_NN(c->self);
     ev_timer_again(feersum_ev_loop, &c->write_ev_timer);
 }
 
 INLINE_UNLESS_DEBUG static void
 stop_write_timer(struct feer_conn *c) {
+    /* Structural stop: any pending paced re-invitation dies with the timer. */
+    c->poll_retry_pending = 0;
+    c->poll_retry_backoff = 0;
     if (unlikely(!ev_is_active(&c->write_ev_timer)))
         return;
     trace("stop write timer %d\n",c->fd);
     ev_timer_stop(feersum_ev_loop, &c->write_ev_timer);
     SvREFCNT_dec(c->self);
+}
+
+/* A write poll_cb was invited and declined - made no write call at all.  The
+ * invitation was already delivered (the drain event the POD promises), and
+ * re-arming the level-triggered write watcher on an empty, always-writable
+ * socket just delivers it again every loop iteration: ~1M calls/sec, a whole
+ * core.  Park the watcher and schedule a paced re-invitation instead, 1ms
+ * doubling to 100ms, reset by any write progress.  An app that resumes by
+ * writing from its own event (the documented shape) re-arms instantly via
+ * conn_write_ready and never waits on this.  Deliberately NO write deadline
+ * while parked: an app with nothing to say yet is the long-poll shape, which
+ * must not be reaped (the H2 pump states the same rule); the peer-gone check
+ * on each paced retry still notices a vanished client. */
+static void
+feersum_poll_retry_park(struct feer_conn *c)
+{
+    double iv;
+    stop_write_watcher(c);   /* no-op for an H2 pseudo-conn (never armed) */
+    iv = FEER_POLL_RETRY_MIN * (double)(1u << c->poll_retry_backoff);
+    if (iv > FEER_POLL_RETRY_MAX) iv = FEER_POLL_RETRY_MAX;
+    if (c->poll_retry_backoff < FEER_POLL_RETRY_BACKOFF_CAP)
+        c->poll_retry_backoff++;
+    c->poll_retry_pending = 1;
+    if (likely(!ev_is_active(&c->write_ev_timer)))
+        SvREFCNT_inc_void_NN(c->self);
+    c->write_ev_timer.repeat = iv;
+    ev_timer_again(feersum_ev_loop, &c->write_ev_timer);
+    trace("poll_cb declined, parked fd=%d retry in %.3fs\n", c->fd, iv);
 }
 
 INLINE_UNLESS_DEBUG static void
@@ -1295,6 +1348,7 @@ try_conn_write(EV_P_ struct ev_io *w, int revents)
             goto try_write_finished;
         }
 
+        unsigned int writes_before = c->poll_writes_seen;
         if (c->poll_write_cb_is_io_handle)
             pump_io_handle(c);
         else
@@ -1302,22 +1356,24 @@ try_conn_write(EV_P_ struct ev_io *w, int revents)
 
         // callback didn't write anything:
         if (unlikely(!c->wbuf_rinq)) {
-            /* Re-arming a level-triggered EV_WRITE on a drained, always
-             * writable socket means this fires again immediately, so a
-             * callback that keeps declining spins at ~1M calls/sec on one
-             * core.  Whether that re-invitation should happen at all is a
-             * contract question (the POD says the callback fires when the
-             * buffer DRAINS, which is one event, not a continuous state) and
-             * is left alone here.  What is not a question: the read watcher
-             * was stopped when the request completed and writev never runs on
-             * an empty buffer, so nothing ever notices the peer has gone -
-             * the spin continued at full rate on a closed connection,
-             * forever.  Look, cheaply, and only on this already-pathological
-             * path. */
+            /* The read watcher was stopped when the request completed and
+             * writev never runs on an empty buffer, so nothing else ever
+             * notices the peer has gone - before this check the loop below
+             * kept running at full rate on a closed connection, forever. */
             if (unlikely(peer_is_gone(c))) {
                 trace("poll_cb produced nothing and the peer is gone %d\n", w->fd);
                 change_responding_state(c, RESPOND_SHUTDOWN);
                 goto try_write_finished;
+            }
+            /* Pure decline: the callback made no write call at all.  The
+             * drain invitation was delivered, so park and pace instead of
+             * spinning the level-triggered watcher (see the park helper).
+             * An empty write() counts as engagement and stays hot - the same
+             * distinction the H2 pump draws with writes_seen. */
+            if (c->responding == RESPOND_STREAMING && c->poll_write_cb
+                && c->poll_writes_seen == writes_before) {
+                feersum_poll_retry_park(c);
+                goto try_write_cleanup;
             }
             goto try_write_again;
         }

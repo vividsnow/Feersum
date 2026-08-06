@@ -227,6 +227,21 @@ A reference to the writer is passed in as the first and only argument to the
 sub.  It's recommended that you use C<$_[0]> rather than closing-over on C<$w>
 to prevent a circular reference.
 
+Each call is an invitation, not a busy-poll.  A callback that has nothing to
+say yet can simply return without writing: the response is then parked and
+re-invited on a gentle backoff (roughly 1ms doubling to 100ms, reset by any
+write), instead of being called in a tight loop.  Writing from any other
+event source - a timer, an upstream socket - resumes the stream immediately,
+which is the recommended shape for relays and SSE.  A zero-length
+C<< $w->write("") >> counts as engagement and requests an immediate
+re-invitation; use it only when more data really is imminent, since a
+callback that does nothing but empty writes runs at full speed.  These rules
+apply identically to HTTP/1.x (plain and TLS) and HTTP/2.  A parked response
+has no write deadline - like any quietly waiting stream, ending it is the
+application's job - but a client that disconnected is normally noticed at
+the next paced retry (on TLS only when the close was abrupt; a graceful
+close_notify is only noticed on the next write, as for any quiet stream).
+
 Something else must then keep the writer alive.  Dropping the last reference
 calls C<DESTROY>, which closes the writer and so ends the response - and
 because that also clears the poll callback, a writer whose only reference was
