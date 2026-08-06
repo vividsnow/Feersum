@@ -82,6 +82,13 @@ read (feer_conn_handle *hdl, SV *buf, size_t len, ...)
     if (unlikely(offset > (ssize_t)src_len))
         offset = src_len;
 
+    /* Clamp against the buffer BEFORE adding: len is a size_t, so a negative
+     * length arrives as a huge one, and len+offset then wraps back under
+     * src_len and defeats the check below.  Reading more than the buffer
+     * holds is impossible anyway, so this costs a compare and no behaviour. */
+    if (unlikely(len > src_len))
+        len = src_len;
+
     if (unlikely(len + offset > src_len))
         len = src_len - offset;
 
@@ -164,6 +171,13 @@ write (feer_conn_handle *hdl, ...)
     // the write path can tell engagement from a pure decline.  See
     // poll_writes_seen in feersum_core.h; mirrors the H2 pump's writes_seen.
     c->poll_writes_seen++;
+
+    // substr($x,...) passed straight to write() arrives as a magic lvalue
+    // whose value has not been fetched yet, so the SvOK guards below read it
+    // as undef and the write silently vanished.  Resolve once here: fetching
+    // per SvPV instead would give a tied scalar a different value each time.
+    if (unlikely(items == 2 && SvGMAGICAL(ST(1))))
+        ST(1) = sv_2mortal(newSVsv(ST(1)));
 
     // HEAD carries no content, so measure the body and discard it.  Must come
     // before the state check: an H2 no-body response is already completed at
@@ -610,6 +624,9 @@ size_t
 send_response (struct feer_conn *c, SV* message, AV *headers, SV *body)
     PROTOTYPE: $$\@$
     CODE:
+        /* As in write(): a magic lvalue (substr, $1) has no value yet. */
+        if (unlikely(SvGMAGICAL(body)))
+            body = sv_2mortal(newSVsv(body));
         if (unlikely(!SvOK(body)))
             croak("can't send_response with an undef body");
         /* Screen the body BEFORE start_response: it queues an unterminated

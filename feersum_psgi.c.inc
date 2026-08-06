@@ -767,6 +767,11 @@ feer_status_code(pTHX_ SV *message)
     if (grok_number(SvPVX_const(message), mlen > 3 ? 3 : mlen, &code)
             != IS_NUMBER_IN_UV)
         return 0;
+    /* "200 OK" is the only long form.  Anything else after the digits is
+     * copied into the status line verbatim, and "HTTP/1.1 200.5" is not a
+     * status line any strict client can parse. */
+    if (unlikely(mlen > 3 && SvPVX_const(message)[3] != ' '))
+        return 0;
     return code;
 }
 
@@ -782,8 +787,9 @@ feersum_check_psgi_status(pTHX_ SV *msg)
     UV code = feer_status_code(aTHX_ msg);
     if (unlikely(!code))
         return "PSGI status must start with a positive number";
-    if (unlikely(code < 100 || code > 999))
-        return "PSGI status must be a three-digit number";
+    /* Must match feersum_start_response's bounds exactly - see above. */
+    if (unlikely(code > 599 || (code < 200 && code != 101)))
+        return "PSGI status must be 200-599, or 101";
     return NULL;
 }
 
@@ -868,12 +874,29 @@ feersum_check_response_framing(pTHX_ SV *message, AV *headers)
         STRLEN hlen, vlen;
         const char *hp = SvPV(hdr, hlen);
         const char *vp = SvPV(val, vlen);
-        for (STRLEN k = 0; k < hlen; k++)
-            if (unlikely(hp[k] == '\r' || hp[k] == '\n' || hp[k] == ':'))
-                return "Response header name contains CR, LF, or colon";
-        for (STRLEN k = 0; k < vlen; k++)
-            if (unlikely(vp[k] == '\r' || vp[k] == '\n'))
-                return "Response header value contains CR or LF";
+        if (unlikely(hlen == 0))
+            return "Response header name is empty";
+        /* Same comparison count as the CR/LF/colon test it replaces: a name
+         * byte at or below SP is always wrong, so one range test covers NUL
+         * (which truncates the field at some downstream parsers and not
+         * others) and a leading space (which makes the line read as an
+         * obs-fold continuation of the one before it). */
+        for (STRLEN k = 0; k < hlen; k++) {
+            unsigned char ch = (unsigned char)hp[k];
+            if (unlikely(ch <= 0x20 || ch == 0x7F || ch == ':'))
+                return (ch == '\r' || ch == '\n' || ch == ':')
+                     ? "Response header name contains CR, LF, or colon"
+                     : "Response header name contains a space or control character";
+        }
+        for (STRLEN k = 0; k < vlen; k++) {
+            unsigned char ch = (unsigned char)vp[k];
+            if (unlikely(ch < 0x20 || ch == 0x7F)) {
+                if (ch == '\t') continue;   /* HTAB is legal in a field value */
+                return (ch == '\r' || ch == '\n')
+                     ? "Response header value contains CR or LF"
+                     : "Response header value contains a control character";
+            }
+        }
     }
     return NULL;
 }
@@ -947,8 +970,13 @@ feersum_start_response (pTHX_ struct feer_conn *c, SV *message, AV *headers,
     // exactly three digits; a negative IV would otherwise wrap to a 20-digit UV.
     if (unlikely(!code))
         croak("first parameter is not a number or doesn't start with digits");
-    if (unlikely(code < 100 || code > 999))
-        croak("response status must be a three-digit number, got %"UVuf, code);
+    /* A 1xx is INTERIM: as a final status the client keeps waiting and reads
+     * the next response on the connection as this request's, so every later
+     * response is misattributed.  101 is the exception - the upgrade
+     * handshake really is final.  The 599 bound matches h2_build_nva, so the
+     * transports agree on what an app may send. */
+    if (unlikely(code > 599 || (code < 200 && code != 101)))
+        croak("response status must be 200-599, or 101, got %"UVuf, code);
 
     change_responding_state(c, streaming ? RESPOND_STREAMING : RESPOND_NORMAL);
 
@@ -1194,9 +1222,18 @@ feersum_write_whole_body (pTHX_ struct feer_conn *c, SV *body)
                 AV *ab = (AV*)refd;
                 body_sv = sv_2mortal(newSVpvs(""));
                 I32 amax = av_len(ab);
+                /* Append BYTES, as the H1 path does by queueing each element's
+                 * own buffer.  sv_catsv applies character semantics, so one
+                 * UTF8-flagged element upgraded the accumulator and re-encoded
+                 * every byte element after it - the same array body went out
+                 * as different bytes on H2 than on H1. */
                 for (I32 i = 0; i <= amax; i++) {
                     SV *sv = fetch_av_normal(aTHX_ ab, i);
-                    if (sv) sv_catsv(body_sv, sv);
+                    if (sv) {
+                        STRLEN el_len;
+                        const char *el = SvPV(sv, el_len);
+                        sv_catpvn(body_sv, el, el_len);
+                    }
                 }
             } else {
                 croak("body must be a scalar, scalar reference or array reference");
