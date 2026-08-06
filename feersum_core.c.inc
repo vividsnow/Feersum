@@ -320,8 +320,13 @@ invoke_shutdown_cb(pTHX_ struct feer_server *server)
     call_sv(cb, G_EVAL|G_VOID|G_DISCARD|G_NOARGS);
     SPAGAIN;
     trace3("called shutdown handler\n");
-    if (SvTRUE(ERRSV))
+    /* Report it, as the access-log and request callbacks do.  Swallowing it
+     * left a worker that had already closed its listeners and would never
+     * finish shutting down, with nothing logged anywhere to say why. */
+    if (SvTRUE(ERRSV)) {
+        trouble("shutdown callback died: %-p\n", ERRSV);
         sv_setsv(ERRSV, &PL_sv_undef);
+    }
     SvREFCNT_dec(cb);
     FREETMPS;
     LEAVE;
@@ -1030,8 +1035,9 @@ feer_linger_close(struct feer_conn *c, const char *where)
          * holding it to the end of a courtesy drain would pin app resources
          * for up to linger_timeout on every close-response.  DESTROY's own
          * dec is NULL-safe. */
-        SvREFCNT_dec(c->ext_guard);
-        c->ext_guard = NULL;
+        /* NULL before dec: the guard's DESTROY can register a replacement,
+         * and clearing the field afterwards would drop it on the floor. */
+        { SV *g = c->ext_guard; c->ext_guard = NULL; SvREFCNT_dec(g); }
         /* Join the idle list: nothing is in flight that a close can hurt, so
          * capacity pressure (max_connections eviction) and the graceful
          * shutdown sweep may reap the connection early rather than wait out

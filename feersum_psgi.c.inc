@@ -1551,6 +1551,17 @@ feersum_handle_psgi_response(
             return;
         }
     }
+    /* Likewise for the state: a nested callback can have answered already.  A
+     * psgi.input poll_cb runs while the handler is still on the stack, so one
+     * that dies takes call_died's 500 and leaves RESPOND_SHUTDOWN behind; the
+     * handler then returns its triplet and start_response croaks with nothing
+     * to catch it, killing the worker instead of that one request. */
+    if (unlikely(c->responding != RESPOND_NOT_STARTED)) {
+        sv_setpvs(ERRSV, "PSGI app returned a response after the response had "
+                         "already started");
+        call_died(aTHX_ c, "PSGI request");
+        return;
+    }
     /* start_response croaks on this, and this path has no G_EVAL above it. */
     if (unlikely(c->io_taken)) {
         sv_setpvs(ERRSV, "PSGI app took psgix.io and then returned a response; "
@@ -1686,8 +1697,12 @@ static SV*
 feersum_conn_guard(pTHX_ struct feer_conn *c, SV *guard)
 {
     if (guard) {
-        SvREFCNT_dec(c->ext_guard); /* NULL-safe */
+        /* Install before dec (both NULL-safe): the outgoing guard's DESTROY
+         * may call back in here to register another, and dec-then-assign
+         * would overwrite that one instead of replacing the old. */
+        SV *old = c->ext_guard;
         c->ext_guard = SvOK(guard) ? newSVsv(guard) : NULL;
+        SvREFCNT_dec(old);
     }
     return c->ext_guard ? newSVsv(c->ext_guard) : &PL_sv_undef;
 }

@@ -386,8 +386,10 @@ it will be immediately flushed to the socket.
             $KEEP{0+$w} = $w;
             $w->poll_cb(sub {
                 $_[0]->write(get_next_chunk());
+                # Key the stash off $w: $_[0] is a fresh handle for this one
+                # invocation, so 0+$_[0] never matches what was stored.
                 # will also unset the poll_cb:
-                if ($n++ >= 100) { delete $KEEP{0+$_[0]}; $_[0]->close }
+                if ($n++ >= 100) { delete $KEEP{0+$w}; $_[0]->close }
             });
         };
     };
@@ -618,9 +620,10 @@ stop the callback from getting called.
     # dropping the last reference closes the response.  See below.
     $KEEP{0+$w} = $w;
     $w->poll_cb(sub {
-        # $_[0] is a copy of $w so a closure doesn't need to be made
+        # $_[0] is a fresh handle for THIS invocation, not $w itself:
+        # key the stash off $w, which the closure already captures.
         $_[0]->write(get_next_chunk());
-        if ($n++ >= 100) { delete $KEEP{0+$_[0]}; $_[0]->close }
+        if ($n++ >= 100) { delete $KEEP{0+$w}; $_[0]->close }
     });
 
 B<You must keep a reference to the writer alive> for as long as you intend to

@@ -1017,7 +1017,9 @@ DESTROY (struct feer_conn *c)
 
     SvREFCNT_dec(c->poll_write_cb);
     SvREFCNT_dec(c->poll_read_cb);
-    SvREFCNT_dec(c->ext_guard);
+    /* NULL before dec: a guard's DESTROY that touches the connection must not
+     * find ext_guard still pointing at the SV perl is in the middle of freeing. */
+    { SV *g = c->ext_guard; c->ext_guard = NULL; SvREFCNT_dec(g); }
     /* A request whose response never completed - client gone, error teardown,
      * or an H2 stream, which does not pass through handle_keepalive_or_close -
      * still gets its line here, and the captured SVs are always released. */

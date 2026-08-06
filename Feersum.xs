@@ -345,9 +345,13 @@ max_requests_per_worker (struct feer_server *server, ...)
     PPCODE:
 {
     if (items > 1) {
-        IV limit = SvIV(ST(1));
-        if (limit < 0)
+        /* Clamp on the NV, as the other limits do: SvIV saturates to IV_MIN
+         * at 2**63 and to -1 past UV range, so a large positive limit was
+         * rejected as "negative", and NaN became 0 - silently no retirement. */
+        NV want = SvNV(ST(1));
+        if (!(want >= 0.0))
             croak("max_requests_per_worker must be non-negative");
+        UV limit = want >= (NV)UV_MAX ? UV_MAX : (UV)want;
         if (limit && (items < 3 || !IsCodeRef(ST(2))))
             croak("must supply a code reference to run once the worker has drained");
         SvREFCNT_dec(server->max_requests_cb_cv);
