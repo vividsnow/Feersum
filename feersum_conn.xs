@@ -1028,6 +1028,9 @@ DESTROY (struct feer_conn *c)
     {
         struct feer_server *server = c->server;
         server->active_conns--;
+#ifdef FEERSUM_HAS_H2
+        if (c->is_h2_stream) server->active_h2_streams--;
+#endif
         SvREFCNT_dec(server->self); // release server ref held since new_feer_conn
 
         /* If a listener was capacity-paused, clear that bit now that a slot

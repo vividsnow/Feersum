@@ -286,6 +286,7 @@ feer_h2_create_pseudo_conn(pTHX_ struct feer_h2_stream *stream)
     SvREADONLY_on(self);
 
     srvr->active_conns++;
+    srvr->active_h2_streams++;
     stream->pseudo_conn = pc;
     return pc;
 }

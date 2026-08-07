@@ -566,6 +566,11 @@ struct feer_server {
      * was emitted one request late with the inter-request gap as its time. */
     SV   *access_log_cb_cv;
     int   active_conns;
+    /* Of active_conns, how many are H2 pseudo-conns rather than sockets.
+     * max_connections admits sockets; streams have their own bound in
+     * max_h2_concurrent_streams, and counting them here too made the two
+     * limits multiply. */
+    int   active_h2_streams;
     UV    total_requests;
     double       read_timeout;
     double       header_timeout;
