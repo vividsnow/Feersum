@@ -122,7 +122,11 @@ $feer->request_handler(sub {
 my $cv = AE::cv;
 my $resp2 = '';
 my $h2 = AnyEvent::Handle->new(
-    connect => ['localhost', $port],
+    # 127.0.0.1, not 'localhost': the listener is an IO::Socket::INET, which is
+    # AF_INET-only and so always binds the IPv4 address, while AnyEvent resolves
+    # dual-stack and may try ::1 first.  The IO::Socket::INET client above has
+    # no such ambiguity, which is why only this half of the test fails.
+    connect => ['127.0.0.1', $port],
     on_error => sub { $cv->send },
     on_eof   => sub { $cv->send },
 );
