@@ -833,6 +833,19 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
     if (nread == 0) {
         /* EOF */
         trace("TLS EOF fd=%d\n", c->fd);
+        /* A tunnel peer that half-closes is saying "I am done sending", not
+         * "drop what you owe me".  Closing here discarded everything the app
+         * had already written and everything it still meant to: 16.1% of a
+         * 16MB body arrived, against 100% on both twins.  H2 maps
+         * DATA+END_STREAM to exactly this SHUT_WR, and plain H1 never gets
+         * here because the app owns the fd outright.  Stop reading, let the
+         * app see its EOF, and keep the write side alive so it can still
+         * answer; the app closing its end then runs the normal flush path. */
+        if (c->tls_tunnel && c->tls_tunnel_sv0 >= 0 && !c->tls_tunnel_eof) {
+            ev_io_stop(feersum_ev_loop, &c->read_ev_io);
+            shutdown(c->tls_tunnel_sv0, SHUT_WR);
+            goto tls_read_cleanup;
+        }
         change_receiving_state(c, RECEIVE_SHUTDOWN);
         stop_all_watchers(c);
         safe_close_conn(c, "TLS EOF");
