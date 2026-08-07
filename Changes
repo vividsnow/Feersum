@@ -35,6 +35,10 @@ Revision history for Perl extension Feersum
           is negative (it could abort the whole server)
         - $w->write(substr($x, ...)) and send_response(..., substr($x, ...))
           no longer silently write nothing
+        - http/2 tunnels (extended CONNECT) now apply the same 16MB
+          app-to-client backpressure cap the TLS relay does
+        - a tunnelled app that closes its handle with unread inbound data no
+          longer has its queued outbound bytes discarded
         - a psgi.input poll_cb that dies now costs that one request (500)
           instead of killing the server process
         - a graceful_shutdown or worker-retirement callback that dies is
