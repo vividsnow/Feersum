@@ -5,6 +5,7 @@ use Socket qw/SOMAXCONN/;
 use IO::Socket::INET;
 use blib;
 use Carp qw(carp croak);
+use File::Spec ();
 use Encode ();
 use POSIX ();
 use AnyEvent ();
@@ -33,8 +34,46 @@ sub import {
     *{$pkg.'::run_client'} = \&run_client;
     *{$pkg.'::tls_client_ok'} = \&tls_client_ok;
     *{$pkg.'::reap_server'} = \&reap_server;
+    *{$pkg.'::run_capped'} = \&run_capped;
 
     return 1;
+}
+
+# Run a command with a wall-clock cap and return whatever it printed, including
+# the partial output of a run we had to kill.
+#
+# This replaces `timeout N cmd ...` in backticks.  timeout(1) is GNU coreutils:
+# it does not exist on macOS or the BSDs, where the shell-out failed outright
+# and the test then matched its assertion against "sh: timeout: command not
+# found" instead of against the server's response.
+#
+# The ALRM handler kills the child but does NOT die: the pipe then reaches EOF,
+# the read loop ends normally, and we keep what the command managed to emit -
+# which is what timeout(1) gives you and what the callers rely on.
+sub run_capped {
+    my ($secs, $cmd, %opt) = @_;
+    my $pid = open(my $fh, '-|');
+    return '' unless defined $pid;
+    if (!$pid) {
+        if ($opt{merge_stderr}) { open STDERR, '>&', \*STDOUT }
+        else { open STDERR, '>', File::Spec->devnull }
+        exec @$cmd;
+        POSIX::_exit(127);
+    }
+    my $out = '';
+    {
+        local $SIG{ALRM} = sub { kill 'KILL', $pid };
+        alarm $secs;
+        while (1) {
+            my $n = sysread($fh, my $buf, 65536);
+            last if !defined $n || $n == 0;
+            $out .= $buf;
+        }
+        alarm 0;
+    }
+    close $fh;
+    waitpid $pid, 0;
+    return $out;
 }
 
 # Stop a forked test server and reap it, without ever blocking indefinitely.

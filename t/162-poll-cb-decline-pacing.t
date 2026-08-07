@@ -195,7 +195,8 @@ SKIP: {
 SKIP: {
     skip 'H2 or nghttp not available', 1 unless $h2_ok;
     my $max = 15 * TIMEOUT_MULT;
-    my $out = `timeout $max nghttp --no-verify 'https://127.0.0.1:$tport/decline3' 2>/dev/null`;
+    my $out = run_capped($max,
+        ['nghttp', '--no-verify', "https://127.0.0.1:$tport/decline3"]);
     like $out, qr/done after 4 invites/,
         'H2 decline is re-invited by the paced timer instead of stalling';
 }

@@ -177,7 +177,9 @@ SKIP: {
 SKIP: {
     skip 'H2 or nghttp not available', 1 unless $h2_ok;
     my $max = 15 * TIMEOUT_MULT;
-    my $out = `timeout $max nghttp --no-verify -v 'https://127.0.0.1:$tport/die-after-write' 2>&1`;
+    my $out = run_capped($max,
+        ['nghttp', '--no-verify', '-v', "https://127.0.0.1:$tport/die-after-write"],
+        merge_stderr => 1);
     like $out, qr/RST_STREAM/,
         'H2 dying streamer: client receives RST_STREAM, not END_STREAM';
 }
