@@ -173,6 +173,7 @@ t/168-tls-bad-record.t
 t/169-max-read-buf-twin.t
 t/170-tls-tunnel-half-close.t
 t/171-return-from-io-fd-ownership.t
+t/172-psgi-env-forbidden-keys.t
 t/17-priority.t
 t/18-epoll-exclusive.t
 t/19-runner-validation.t

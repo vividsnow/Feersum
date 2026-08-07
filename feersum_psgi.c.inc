@@ -269,6 +269,13 @@ feersum_env(pTHX_ struct feer_conn *c)
             *key++ = ascii_upper_dash[(unsigned char)hdr->name[j]];
         }
 
+        /* PSGI forbids these two keys outright.  The dashed spellings are
+         * handled above, but normalisation maps '_' to the same key, so a
+         * client sending "Content_Length:" would otherwise inject one. */
+        if (unlikely((klen == 19 && memEQ(kbuf, "HTTP_CONTENT_LENGTH", 19))
+                  || (klen == 17 && memEQ(kbuf, "HTTP_CONTENT_TYPE", 17))))
+            continue;
+
         SV **fetched = hv_fetch(e, kbuf, klen, 1);
         trace("adding header to env (fd %d) %.*s: %.*s\n",
             c->fd, (int)klen, kbuf, (int)hdr->value_len, hdr->value);

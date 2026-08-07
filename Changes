@@ -103,6 +103,11 @@ Revision history for Perl extension Feersum
           with both syscalls succeeding. feersum now declines to close a
           descriptor it gave away. this also removes the "close ... Bad file
           descriptor" noise an app saw when it closed its own psgix.io handle
+        - a client can no longer inject HTTP_CONTENT_LENGTH / HTTP_CONTENT_TYPE
+          into the psgi env, which psgi 1.1 forbids outright, by spelling the
+          header with an underscore ("Content_Length:"). the special case only
+          matched the dashed spelling while name normalisation maps both to the
+          same key, so the underscore form reached the ordinary HTTP_ path
         - return_from_io()/return_from_psgix_io() now take a private duplicate
           of the descriptor instead of leaving the app's handle and feersum
           both owning one number. releasing the handle at the end of the
