@@ -1835,6 +1835,12 @@ socket.  Passing a different filehandle used to be accepted, and it spliced
 that handle's buffered bytes into this connection's next request while leaving
 the real handle able to close a descriptor Feersum had reclaimed.
 
+=item * Handing the socket back now takes a private duplicate of the
+descriptor, so the returned handle no longer shares one with Feersum.  Code
+written to the old rule (keep a reference alive for the life of the process,
+because there was no safe moment to drop it) still works and can now simply
+release the handle when it is done.
+
 =back
 
 =head2 Error reporting

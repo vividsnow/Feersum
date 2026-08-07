@@ -186,22 +186,13 @@ the IO handle will be pulled back into Feersum's read buffer.
 
 Returns the number of bytes pulled back from the IO buffer.
 
-B<You must keep a reference to C<$io> alive> (push it onto a package-level
-array, say).  The handle shares Feersum's descriptor rather than owning a copy
-of it, and handing the socket back does not change that.  If the last reference
-goes away while the connection is still up, the L<IO::Socket> destructor closes
-the shared descriptor and the connection dies silently: no error, and the next
-keepalive request is simply lost.
-
-Dropping it B<after> the connection has closed is worse, not better.  Feersum
-will have closed that descriptor already, the kernel is free to hand the number
-to a new connection, and the handle's destructor then closes it a second time,
-killing an unrelated client.  So do not treat "wait for the connection to end,
-then release the handle" as the safe pattern: there is no moment at which
-dropping it is guaranteed safe.  Keep the reference for the life of the
-process, or do not call C<return_from_io()> at all and let the takeover stand
-(a taken-over descriptor B<is> owned by the handle, and dropping that is
-always safe).
+C<$io> stays usable afterwards, and you may release it whenever you like.
+C<io()> hands out a handle that shares Feersum's descriptor rather than owning
+a copy, so handing the socket back takes a private duplicate of it: dropping
+the handle no longer closes the connection Feersum has just reclaimed, and can
+never close a recycled descriptor belonging to some other client.  The socket
+does stay open until the handle goes away, so do not hoard handles you have
+finished with.
 
 B<Not applicable> for TLS tunnel connections or HTTP/2 streams: calling
 C<return_from_io()> on either croaks.  (For an HTTP/2 Extended CONNECT

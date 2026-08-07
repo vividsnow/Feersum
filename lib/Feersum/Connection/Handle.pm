@@ -289,9 +289,9 @@ Methods in common to both types of handles.
 
 Returns control of the socket back to Feersum after C<psgix.io> was used.
 This is the PSGI-handle equivalent of C<< $req->return_from_io($io) >> on
-the connection object.  As there, B<you must keep a reference to C<$io> alive>
-for the life of the connection or its destructor closes the shared descriptor
-and the connection dies silently.  See L<Feersum::Connection/"$req-E<gt>return_from_io($io)">.
+the connection object.  As there, the hand-back takes a private duplicate of
+the descriptor, so C<$io> stays usable and is safe to release at any time.
+See L<Feersum::Connection/"$req-E<gt>return_from_io($io)">.
 
 =item C<< $h->response_guard($guard) >>
 

@@ -585,13 +585,41 @@ feersum_return_from_io(pTHX_ struct feer_conn *c, SV *io_sv, const char *func_na
         }
     }
 
+    /* io() handed out a handle wrapping c->fd itself, so taking the socket
+     * back would leave two owners of one number: the handle closes it when the
+     * app drops it - written the obvious way, at the end of the callback - and
+     * Feersum closes it again later, by then possibly a recycled descriptor. */
+    {
+#ifdef F_DUPFD_CLOEXEC
+        int nfd = fcntl(c->fd, F_DUPFD_CLOEXEC, 0);
+#else
+        int nfd = dup(c->fd);
+        if (nfd >= 0) (void)fcntl(nfd, F_SETFD, FD_CLOEXEC);
+#endif
+        if (unlikely(nfd < 0))
+            croak("%s: cannot duplicate the connection descriptor: %s",
+                  func_name, strerror(errno));
+        /* ev_io_set is undefined on an active watcher.  hand_out_raw_fd stops
+         * the read watcher and deliberately leaves the write one alone, but
+         * rebind both the same way rather than rely on that from here. */
+        int r_active = ev_is_active(&c->read_ev_io);
+        int w_active = ev_is_active(&c->write_ev_io);
+        if (r_active) ev_io_stop(feersum_ev_loop, &c->read_ev_io);
+        if (w_active) ev_io_stop(feersum_ev_loop, &c->write_ev_io);
+        ev_io_set(&c->read_ev_io, nfd, EV_READ);
+        ev_io_set(&c->write_ev_io, nfd, EV_WRITE);
+        if (r_active) ev_io_start(feersum_ev_loop, &c->read_ev_io);
+        if (w_active) ev_io_start(feersum_ev_loop, &c->write_ev_io);
+        c->fd = nfd;
+    }
+
     /* Reset connection state for next request (like keepalive reset) */
     change_responding_state(c, RESPOND_NOT_STARTED);
     change_receiving_state(c, RECEIVE_HEADERS);
     c->expected_cl = 0;
     c->received_cl = 0;
     c->io_taken = 0;
-    c->fd_given_away = 0;   // handed back: Feersum owns the descriptor again
+    c->fd_given_away = 0;   // Feersum owns its own descriptor now
     free_request(c);
 
     if (c->rbuf && cnt <= 0)
