@@ -33,16 +33,47 @@ my $h2_ok = $probe->has_tls() && $probe->has_h2()
          && -f 't/certs/alpha.crt' && -f 't/certs/alpha.key'
          && do { my $p = `which nghttp 2>/dev/null`; chomp $p; -x ($p || '') };
 
-plan tests => 7 + ($h2_ok ? 3 : 0);
+# Eight H1 tests always, plus two H2 ones that SKIP (and so still report) when
+# TLS/H2/nghttp are missing.  The H1 legs run over a PLAIN listener: nothing
+# here is about transport, and fetching them through `openssl s_client` made
+# every one of them return an empty body wherever that binary is LibreSSL or
+# absent - alpine, macOS and the BSDs - while passing on the machine that had
+# GNU openssl.
+plan tests => 10;
 
 my $BUF = 'data-payload';
 
-my ($sock, $port) = get_listen_socket();
-ok $sock, "listen socket on port $port";
+my $app = sub {
+    my $env = shift;
+    my ($k) = ($env->{PATH_INFO} // '') =~ m{^/(.+)};
+    $k //= '';
+    # Array bodies (also the H2 leg).
+    if ($k eq 'mixed') {
+        my $u = chr(0xE9); utf8::upgrade($u);
+        return [200, ['Content-Type' => 'application/octet-stream'],
+                [$u, chr(0xFF)]];
+    }
+    if ($k eq 'bytes') {
+        return [200, ['Content-Type' => 'application/octet-stream'],
+                ["ab", "cd"]];
+    }
+    # Streaming writer takes magic lvalues directly.
+    return sub {
+        my $w = $_[0]->([200, ['Content-Type' => 'text/plain']]);
+        $w->write(substr($BUF, 4))    if $k eq 'w-substr2';
+        $w->write(substr($BUF, 0, 4)) if $k eq 'w-substr3';
+        if ($k eq 'w-dollar1') { "match-me" =~ /(match)/; $w->write($1) }
+        if ($k eq 'w-lexical') { my $x = substr($BUF, 4); $w->write($x) }
+        $w->close;
+    };
+};
 
-my $server = fork();
-die "fork: $!" unless defined $server;
-if (!$server) {
+# $tls is a pair of set_tls args, or nothing for a plain listener.
+sub spawn_server {
+    my ($sock, @tls) = @_;
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+    return $pid if $pid;
     open STDOUT, '>', '/dev/null';
     open STDERR, '>', '/dev/null';
     no warnings 'once';
@@ -50,59 +81,38 @@ if (!$server) {
     my $f = Feersum->new_instance();
     $f->use_socket($sock);
     $f->read_timeout(30 * TIMEOUT_MULT);
-    if ($h2_ok) {
-        $f->set_tls(h2 => 1, cert_file => 't/certs/alpha.crt',
-                    key_file => 't/certs/alpha.key');
-    }
-    $f->psgi_request_handler(sub {
-        my $env = shift;
-        my ($k) = ($env->{PATH_INFO} // '') =~ m{^/(.+)};
-        $k //= '';
-        # Array bodies (also the H2 leg).
-        if ($k eq 'mixed') {
-            my $u = chr(0xE9); utf8::upgrade($u);
-            return [200, ['Content-Type' => 'application/octet-stream'],
-                    [$u, chr(0xFF)]];
-        }
-        if ($k eq 'bytes') {
-            return [200, ['Content-Type' => 'application/octet-stream'],
-                    ["ab", "cd"]];
-        }
-        # Streaming writer takes magic lvalues directly.
-        return sub {
-            my $w = $_[0]->([200, ['Content-Type' => 'text/plain']]);
-            $w->write(substr($BUF, 4))    if $k eq 'w-substr2';
-            $w->write(substr($BUF, 0, 4)) if $k eq 'w-substr3';
-            if ($k eq 'w-dollar1') { "match-me" =~ /(match)/; $w->write($1) }
-            if ($k eq 'w-lexical') { my $x = substr($BUF, 4); $w->write($x) }
-            $w->close;
-        };
-    });
+    $f->set_tls(@tls) if @tls;
+    $f->psgi_request_handler($app);
     my $life_timer = EV::timer(120 * TIMEOUT_MULT, 0, sub { EV::break() });
     EV::run();
     POSIX::_exit(0);
 }
+
+my ($sock, $port) = get_listen_socket();
+ok $sock, "listen socket on port $port";
+my $server = spawn_server($sock);
 close $sock;
+
+# The H2 leg needs its own TLS listener; the H1 legs above stay plain.
+my ($h2sock, $h2port, $h2server);
+if ($h2_ok) {
+    ($h2sock, $h2port) = get_listen_socket();
+    $h2server = spawn_server($h2sock, h2 => 1, cert_file => 't/certs/alpha.crt',
+                             key_file => 't/certs/alpha.key');
+    close $h2sock;
+}
 select undef, undef, undef, 1 * TIMEOUT_MULT;
 
-# Plain-HTTP fetch.  With TLS enabled the listener speaks TLS, so the magic-SV
-# leg goes over TLS too; either way the body is what we assert on.
 sub body_of {
     my ($path) = @_;
-    my $raw;
-    if ($h2_ok) {
-        $raw = `printf 'GET /$path HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | openssl s_client -quiet -alpn http/1.1 -connect 127.0.0.1:$port 2>/dev/null`;
-    }
-    else {
-        my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port",
-                                      Timeout => 10 * TIMEOUT_MULT) or return '';
-        syswrite $s, "GET /$path HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
-        $raw = '';
-        eval { local $SIG{ALRM} = sub { die "to\n" }; alarm 10 * TIMEOUT_MULT;
-               while (sysread($s, my $c, 4096)) { $raw .= $c } alarm 0; 1 };
-        alarm 0; close $s;
-    }
-    my ($b) = ($raw // '') =~ /\r\n\r\n(.*)$/s;
+    my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port", Proto => 'tcp',
+                                  Timeout => 10 * TIMEOUT_MULT) or return '';
+    syswrite $s, "GET /$path HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    my $raw = '';
+    eval { local $SIG{ALRM} = sub { die "to\n" }; alarm 10 * TIMEOUT_MULT;
+           while (sysread($s, my $c, 4096)) { $raw .= $c } alarm 0; 1 };
+    alarm 0; close $s;
+    my ($b) = $raw =~ /\r\n\r\n(.*)$/s;
     return $b // '';
 }
 
@@ -166,15 +176,18 @@ is dechunk(body_of('w-lexical')), '-payload',
 is unpack('H*', body_of('mixed')), 'c3a9ff',
    'H1 array body is the elements\' bytes, not a character concatenation';
 
+# The H1 twin needs no H2, so it stays outside the SKIP block.
+is unpack('H*', body_of('bytes')), '61626364',
+   'H1 twin of the plain array body';
+
 SKIP: {
-    skip 'no TLS+H2+nghttp', 3 unless $h2_ok;
+    skip 'no TLS+H2+nghttp', 2 unless $h2_ok;
     for my $case (['mixed', 'c3a9ff'], ['bytes', '61626364']) {
-        my $got = `nghttp --no-verify-peer https://127.0.0.1:$port/$case->[0] 2>/dev/null`;
+        my $got = `nghttp --no-verify-peer https://127.0.0.1:$h2port/$case->[0] 2>/dev/null`;
         is unpack('H*', $got // ''), $case->[1],
            "H2 array body '$case->[0]' is the same bytes H1 sends";
     }
-    is unpack('H*', body_of('bytes')), '61626364',
-       'H1 twin of the plain array body';
 }
 
 reap_server($server);
+reap_server($h2server) if $h2server;
