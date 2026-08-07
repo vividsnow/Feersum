@@ -304,8 +304,12 @@ conn_read_timeout (EV_P_ ev_timer *w, int revents)
              * and a GOAWAY, against 8 of 8 on both H1 transports.  Bulk bodies
              * masked it, because their WINDOW_UPDATEs kept resetting the
              * timer.  pseudo_conn is set exactly when a stream is dispatched,
-             * so a half-open stream that never became a request still has no
-             * defence here and is still reaped. */
+             * so a half-open stream that never became a request is reaped -
+             * but only while it is the ONLY stream: the deadline re-arms for
+             * the whole connection, so one live sibling (a quiet websocket)
+             * exempts every half-open stream beside it for as long as it
+             * lasts.  Bounded by max_h2_concurrent_streams x max_body_len,
+             * not by time. */
             if (s->tunnel_established || s->pseudo_conn) {
                 trace("H2 idle timeout deferred, stream live fd=%d\n", c->fd);
                 restart_read_timer(c);
@@ -428,6 +432,19 @@ conn_write_timeout (EV_P_ ev_timer *w, int revents)
     }
 
     trace("write timeout %d\n", c->fd);
+#ifdef FEERSUM_HAS_H2
+    /* Say goodbye the way every other H2 connection teardown does
+     * (conn_read_timeout, recycle_idle_conn, graceful shutdown).  Without
+     * GOAWAY(last_stream_id) a client with requests in flight cannot tell
+     * which were processed, so it cannot safely retry any of them. */
+    if (c->h2_session && !c->h2_goaway_sent) {
+        nghttp2_submit_goaway(c->h2_session, NGHTTP2_FLAG_NONE,
+                              nghttp2_session_get_last_proc_stream_id(c->h2_session),
+                              NGHTTP2_NO_ERROR, NULL, 0);
+        c->h2_goaway_sent = 1;
+        feer_h2_session_send(c);
+    }
+#endif
     feer_shutdown_conn(c, "write timeout");
     change_receiving_state(c, RECEIVE_SHUTDOWN);
 
