@@ -422,8 +422,14 @@ safe_close_conn(struct feer_conn *c, const char *where)
     if (c->tls_tunnel)
         feer_tls_tunnel_shutdown(c);
 
-    // Best-effort TLS close_notify before TCP shutdown
-    if (c->tls && c->tls_handshake_done) {
+    // Best-effort TLS alert before TCP shutdown.  An alert encrypted now
+    // carries a later sequence number than anything still queued in tls_wbuf,
+    // so writing it straight to the fd would put it AHEAD of those records and
+    // the peer could not decrypt it.  Flush first; if the queue will not
+    // drain, send nothing - an undecryptable alert is worse than none.
+    if (c->tls && c->tls_handshake_done && c->tls_wbuf.off > 0)
+        (void)feer_tls_flush_wbuf(c);
+    if (c->tls && c->tls_handshake_done && c->tls_wbuf.off == 0) {
         ptls_buffer_t closebuf;
         ptls_buffer_init(&closebuf, "", 0);
         if (unlikely(c->tls_fatal_alert))
