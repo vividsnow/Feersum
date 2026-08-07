@@ -433,6 +433,21 @@ conn_write_timeout (EV_P_ ev_timer *w, int revents)
 
     trace("write timeout %d\n", c->fd);
 #ifdef FEERSUM_HAS_H2
+    /* An established Extended CONNECT tunnel is exempt from this deadline, as
+     * lib/Feersum.pm promises and as the TLS and plain tunnels already behave:
+     * a websocket whose client stops reading for write_timeout seconds - a
+     * backgrounded tab, a radio gap - must not lose its connection and every
+     * sibling stream on it.  The deadline exists for H2 only to bound tls_wbuf
+     * when a peer stops reading but keeps the session busy (a PING flood
+     * answers itself), so bound that by SIZE here and let the clock pass. */
+    if (c->h2_session && c->tls && c->tls_wbuf.off <= FEER_TUNNEL_MAX_WBUF) {
+        for (struct feer_h2_stream *s = c->h2_streams; s; s = s->next) {
+            if (!s->tunnel_established) continue;
+            trace("H2 write deadline deferred, tunnel live fd=%d\n", c->fd);
+            restart_write_timer(c);
+            goto write_timeout_cleanup;
+        }
+    }
     /* Say goodbye the way every other H2 connection teardown does
      * (conn_read_timeout, recycle_idle_conn, graceful shutdown).  Without
      * GOAWAY(last_stream_id) a client with requests in flight cannot tell
@@ -565,7 +580,19 @@ try_accept_one(EV_P_ struct feer_listen *lsnr, struct feer_server *srvr)
         return 0;
     }
 
-    if (srvr->max_connections > 0 && srvr->active_conns >= srvr->max_connections) {
+    /* Admit against SOCKETS, not against active_conns, which also counts every
+     * H2 pseudo-conn.  One H2 client could hold max_h2_concurrent_streams + 1
+     * slots, so 100 clients consumed 10100 of a default 10000 budget and
+     * paused accept on every listener of the instance - including plain ones -
+     * with nothing to reap it, since a parent with live streams is busy and
+     * read_timeout defers for the whole connection.  Streams are bounded by
+     * max_h2_concurrent_streams; making both limits multiply was the bug.
+     * active_conns itself still reports the total, which is what it is for. */
+    int socket_conns = srvr->active_conns;
+#ifdef FEERSUM_HAS_H2
+    socket_conns -= srvr->active_h2_streams;
+#endif
+    if (srvr->max_connections > 0 && socket_conns >= srvr->max_connections) {
         if (!feer_server_recycle_idle_conn(srvr)) {
             /* At capacity with nothing to recycle: pause the listener so we
              * don't busy-spin accepting-and-closing.  DESTROY will clear the
