@@ -1819,8 +1819,22 @@ h2_tunnel_sv0_read_cb(EV_P_ struct ev_io *w, int revents)
         const char *p = SvPVX(stream->resp_wbuf);
         STRLEN len = SvCUR(stream->resp_wbuf);
 
-        /* If first bytes aren't "HTTP/", not a response - relay as-is */
-        if (len >= 5 && memcmp(p, "HTTP/", 5) != 0) {
+        /* Match as much of a real status line ("HTTP/1.x NNN") as has
+         * arrived, and relay the moment it diverges.  Requiring 5 bytes
+         * before deciding held anything shorter indefinitely - a 2-byte
+         * websocket PING is exactly that shape - and matching only "HTTP/"
+         * let any payload starting with those five bytes stall or, past 8KB,
+         * be discarded. */
+        STRLEN n = len < 12 ? len : 12;
+        int diverged = 0;
+        for (STRLEN k = 0; k < n; k++) {
+            char ch = p[k];
+            if (k < 7)       diverged = (ch != "HTTP/1."[k]);
+            else if (k == 8) diverged = (ch != ' ');
+            else             diverged = !(ch >= '0' && ch <= '9');
+            if (diverged) break;
+        }
+        if (diverged) {
             stream->tunnel_swallow_response = 0;
             stream->resp_wbuf_pos = 0;
             /* resp_wbuf already contains all accumulated data including
@@ -1852,13 +1866,14 @@ h2_tunnel_sv0_read_cb(EV_P_ struct ev_io *w, int revents)
             }
         }
 
-        /* Safety: if buffer exceeds 8KB without \r\n\r\n, give up.
-         * Discard the accumulated HTTP response prefix to avoid sending
-         * raw HTTP/1.1 headers as H2 DATA to the client. */
+        /* Safety: 8KB of something that still looks like a status line but
+         * has no header terminator is malformed either way.  Relay it rather
+         * than discarding: visible garbage is a better failure than silently
+         * swallowing the application's bytes. */
         if (SvCUR(stream->resp_wbuf) > 8192) {
             stream->tunnel_swallow_response = 0;
-            SvCUR_set(stream->resp_wbuf, 0);
             stream->resp_wbuf_pos = 0;
+            goto relay;
         }
         return; /* wait for more data */
     }
