@@ -164,6 +164,12 @@ t/16-req.t
 t/160-tls-max-read-buf-parity.t
 t/161-streaming-die-truncation.t
 t/162-poll-cb-decline-pacing.t
+t/163-tunable-clamp-monotonic.t
+t/164-reader-negative-length.t
+t/165-response-header-hygiene.t
+t/166-body-sv-semantics.t
+t/167-nested-callback-death.t
+t/168-tls-bad-record.t
 t/17-priority.t
 t/18-epoll-exclusive.t
 t/19-runner-validation.t

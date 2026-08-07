@@ -426,7 +426,12 @@ safe_close_conn(struct feer_conn *c, const char *where)
     if (c->tls && c->tls_handshake_done) {
         ptls_buffer_t closebuf;
         ptls_buffer_init(&closebuf, "", 0);
-        ptls_send_alert(c->tls, &closebuf, PTLS_ALERT_LEVEL_WARNING, PTLS_ALERT_CLOSE_NOTIFY);
+        if (unlikely(c->tls_fatal_alert))
+            ptls_send_alert(c->tls, &closebuf, PTLS_ALERT_LEVEL_FATAL,
+                            c->tls_fatal_alert);
+        else
+            ptls_send_alert(c->tls, &closebuf, PTLS_ALERT_LEVEL_WARNING,
+                            PTLS_ALERT_CLOSE_NOTIFY);
         if (closebuf.off > 0) {
             ssize_t wr PERL_UNUSED_DECL;
             wr = write(c->fd, closebuf.base, closebuf.off);

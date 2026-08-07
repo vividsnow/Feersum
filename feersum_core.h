@@ -468,6 +468,9 @@ struct feer_conn {
     uint8_t        *tls_rbuf;
     size_t          tls_rbuf_len;
     unsigned int    tls_handshake_done:1;
+    /* Alert description we owe the peer for a record we could not decrypt.
+     * safe_close_conn sends it as fatal in place of close_notify. */
+    uint8_t         tls_fatal_alert;
 
     int             tls_tunnel_sv0;
     int             tls_tunnel_sv1;

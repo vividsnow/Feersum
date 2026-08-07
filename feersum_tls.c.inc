@@ -467,6 +467,10 @@ drain_tls_tunnel_rbuf(struct feer_conn *c)
             break; /* sv[0] full - let write watcher drain first */
         ptls_buffer_t db;
         int drain_rv = feer_tls_drain_one_record(c, &db);
+        if (unlikely(drain_rv == -2)) {
+            feer_shutdown_conn(c, "TLS receive error (tunnel drain)");
+            return;
+        }
         if (drain_rv < 0) break;
         if (drain_rv == 1) continue; /* non-data (e.g. KeyUpdate) */
         if (tls_tunnel_write_or_buffer(c, (const char *)db.base, db.off) < 0) {
@@ -680,11 +684,24 @@ feer_tls_save_rbuf(struct feer_conn *c, const uint8_t *src, size_t len)
 }
 
 /*
+ * A ptls_receive failure in the SELF_ALERT class names the alert we owe the
+ * peer; RFC 8446 5.2 says a record that fails to decrypt MUST terminate the
+ * connection.  safe_close_conn sends it instead of close_notify.
+ */
+INLINE_UNLESS_DEBUG static void
+feer_tls_note_alert(struct feer_conn *c, int ret)
+{
+    if (PTLS_ERROR_GET_CLASS(ret) == PTLS_ERROR_CLASS_SELF_ALERT)
+        c->tls_fatal_alert = (uint8_t)PTLS_ERROR_TO_ALERT(ret);
+}
+
+/*
  * Decrypt one TLS record from tls_rbuf into decbuf.
  * Returns:  0 = success (caller must ptls_buffer_dispose)
  *           1 = no app data (KeyUpdate/NewSessionTicket) but no error;
  *               caller should retry if tls_rbuf still has data
- *          -1 = error or no data available
+ *          -1 = nothing left to drain, or the peer closed cleanly
+ *          -2 = the record could not be decrypted; caller must tear down
  */
 static int
 feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf)
@@ -705,7 +722,14 @@ feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf)
 
     if (ret != 0) {
         ptls_buffer_dispose(decbuf);
-        return -1;
+        /* A peer close_notify comes back as an error too, and it is the one
+         * that must NOT tear anything down here: a request coalesced ahead of
+         * it in the same segment is already decrypted and still owed a
+         * response.  Every other failure ends the connection. */
+        if (ret == PTLS_ERROR_CLASS_PEER_ALERT + PTLS_ALERT_CLOSE_NOTIFY)
+            return -1;
+        feer_tls_note_alert(c, ret);
+        return -2;
     }
     if (decbuf->off == 0) {
         /* TLS 1.3 non-data record (KeyUpdate, NewSessionTicket) - no app
@@ -718,10 +742,12 @@ feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf)
 
 /* Append decrypted app data to rbuf, then drain any remaining complete TLS
  * records from tls_rbuf into rbuf.  Disposes decbuf.  Returns total bytes
- * appended.  Shared by the steady-state and handshake-coalesced H1 read
- * paths so both feed the parser identically. */
+ * appended, and sets *failed if a record could not be decrypted - the byte
+ * count has no room to say so, and a caller that parses on regardless would
+ * keep a dead connection alive until read_timeout.  Shared by the steady-state
+ * and handshake-coalesced H1 read paths so both feed the parser identically. */
 static size_t
-feer_tls_rbuf_append_drain(struct feer_conn *c, ptls_buffer_t *decbuf)
+feer_tls_rbuf_append_drain(struct feer_conn *c, ptls_buffer_t *decbuf, int *failed)
 {
     dTHX;
     size_t added = 0;
@@ -742,6 +768,8 @@ feer_tls_rbuf_append_drain(struct feer_conn *c, ptls_buffer_t *decbuf)
         added += db.off;
         ptls_buffer_dispose(&db);
     }
+    if (unlikely(drain_rv == -2))
+        *failed = 1;
     return added;
 }
 
@@ -755,6 +783,11 @@ drain_h2_tls_records(struct feer_conn *c)
     while (c->h2_session) {
         ptls_buffer_t db;
         int drain_rv = feer_tls_drain_one_record(c, &db);
+        if (unlikely(drain_rv == -2)) {
+            stop_all_watchers(c);
+            safe_close_conn(c, "TLS receive error (H2 drain)");
+            break;
+        }
         if (drain_rv < 0) break;
         if (drain_rv == 1) continue; /* non-data TLS record */
         feer_h2_session_recv(c, db.base, db.off);
@@ -935,6 +968,7 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
                     if (dec_ret != 0) {
                         ptls_buffer_dispose(&decbuf);
                         if (merged) Safefree(merged);
+                        feer_tls_note_alert(c, dec_ret);
                         stop_all_watchers(c);
                         safe_close_conn(c, "TLS receive error (post-handshake H2)");
                         goto tls_read_cleanup;
@@ -967,6 +1001,7 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
                 if (dec_ret != 0) {
                     ptls_buffer_dispose(&decbuf);
                     if (merged) Safefree(merged);
+                    feer_tls_note_alert(c, dec_ret);
                     stop_all_watchers(c);
                     safe_close_conn(c, "TLS receive error (post-handshake H1)");
                     goto tls_read_cleanup;
@@ -976,7 +1011,15 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
                 /* Drain the remaining records into rbuf and jump to the
                  * shared parse path rather than dispatching per record here:
                  * one dispatch path keeps plain and TLS from drifting. */
-                size_t added = feer_tls_rbuf_append_drain(c, &decbuf);
+                int drain_failed = 0;
+                size_t added = feer_tls_rbuf_append_drain(c, &decbuf, &drain_failed);
+                if (unlikely(drain_failed)) {
+                    if (merged) Safefree(merged);
+                    change_receiving_state(c, RECEIVE_SHUTDOWN);
+                    stop_all_watchers(c);
+                    safe_close_conn(c, "TLS receive error (H1 drain)");
+                    goto tls_read_cleanup;
+                }
                 if (added > 0) {
                     if (merged) Safefree(merged);
                     got_n = (ssize_t)added;
@@ -1015,6 +1058,7 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
         if (ret != 0) {
             trace("TLS receive error fd=%d ret=%d\n", c->fd, ret);
             ptls_buffer_dispose(&decbuf);
+            feer_tls_note_alert(c, ret);
             change_receiving_state(c, RECEIVE_SHUTDOWN);
             stop_all_watchers(c);
             safe_close_conn(c, "TLS receive error");
@@ -1061,7 +1105,14 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
         }
 
         /* HTTP/1.1 over TLS: append decrypted data + drain remaining records */
-        got_n = (ssize_t)feer_tls_rbuf_append_drain(c, &decbuf);
+        int drain_failed = 0;
+        got_n = (ssize_t)feer_tls_rbuf_append_drain(c, &decbuf, &drain_failed);
+        if (unlikely(drain_failed)) {
+            change_receiving_state(c, RECEIVE_SHUTDOWN);
+            stop_all_watchers(c);
+            safe_close_conn(c, "TLS receive error (H1 drain)");
+            goto tls_read_cleanup;
+        }
     }
     goto tls_parse;
 
