@@ -510,6 +510,21 @@ tls_tunnel_sv0_read_cb(EV_P_ struct ev_io *w, int revents)
     char buf[FEER_TUNNEL_BUFSZ];
     ssize_t nread = read(c->tls_tunnel_sv0, buf, sizeof(buf));
 
+    if (nread < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            goto cleanup;
+        /* Closing sv[1] while any inbound byte sits unread makes this read
+         * fail ECONNRESET instead of returning 0 (Linux AF_UNIX).  The app's
+         * end is gone either way, and we still owe the client every byte it
+         * already handed us, so take the EOF path and flush rather than
+         * discarding the queue. */
+        if (errno != ECONNRESET && errno != EPIPE) {
+            feer_shutdown_conn(c, "TLS tunnel read error");
+            goto cleanup;
+        }
+        nread = 0;
+    }
+
     if (nread == 0) {
         /* App closed sv[1].  Closing the connection here discarded whatever
          * ciphertext was still queued - up to the whole 16 MB backpressure
@@ -531,13 +546,6 @@ tls_tunnel_sv0_read_cb(EV_P_ struct ev_io *w, int revents)
         feer_shutdown_conn(c, "TLS tunnel EOF");
         goto cleanup;
     }
-    if (nread < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-            goto cleanup;
-        feer_shutdown_conn(c, "TLS tunnel read error");
-        goto cleanup;
-    }
-
     /* Encrypt and queue for sending */
     if (feer_tls_send(c, buf, nread) != 0) {
         feer_shutdown_conn(c, "TLS tunnel encrypt error");

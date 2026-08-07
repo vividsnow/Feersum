@@ -1728,6 +1728,14 @@ h2_check_stream_poll_cbs(pTHX_ struct feer_conn *c)
 
     for (stream = c->h2_streams; stream && n < FEER_H2_MAX_CONCURRENT_STREAMS;
          stream = stream->next) {
+        /* A tunnel relay paused at the resp_wbuf cap resumes here, once the
+         * wire has drained it back down.  Checked before the poll_write_cb
+         * test below, which a tunnel stream never satisfies. */
+        if (unlikely(stream->tunnel_established) && stream->tunnel_sv0 >= 0
+            && !ev_is_active(&stream->tunnel_read_w)
+            && h2_resp_wbuf_avail(stream) <= FEER_TUNNEL_MAX_WBUF)
+            ev_io_start(feersum_ev_loop, &stream->tunnel_read_w);
+
         struct feer_conn *pc = stream->pseudo_conn;
         if (!pc || pc->responding != RESPOND_STREAMING || !pc->poll_write_cb)
             continue;
@@ -1770,6 +1778,23 @@ h2_tunnel_sv0_read_cb(EV_P_ struct ev_io *w, int revents)
     char buf[FEER_TUNNEL_BUFSZ];
     ssize_t nread = read(stream->tunnel_sv0, buf, sizeof(buf));
 
+    if (nread < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return;
+        /* As in the TLS twin: closing sv[1] with unread inbound bytes fails
+         * this read ECONNRESET rather than returning 0, and RSTing the stream
+         * there threw away every DATA byte still queued in resp_wbuf. */
+        if (errno != ECONNRESET && errno != EPIPE) {
+            ev_io_stop(EV_A, &stream->tunnel_read_w);
+            ev_io_stop(EV_A, &stream->tunnel_write_w);
+            h2_submit_rst(stream->parent->h2_session, stream->stream_id,
+                          NGHTTP2_CONNECT_ERROR);
+            h2_session_send_and_poll(aTHX_ stream->parent);
+            return;
+        }
+        nread = 0;
+    }
+
     if (nread == 0) {
         /* App closed sv[1] - EOF. Signal end of response stream. */
         ev_io_stop(EV_A, &stream->tunnel_read_w);
@@ -1782,18 +1807,6 @@ h2_tunnel_sv0_read_cb(EV_P_ struct ev_io *w, int revents)
         h2_session_send_and_poll(aTHX_ stream->parent);
         return;
     }
-    if (nread < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-            return;
-        /* Real error - reset the stream */
-        ev_io_stop(EV_A, &stream->tunnel_read_w);
-        ev_io_stop(EV_A, &stream->tunnel_write_w);
-        h2_submit_rst(stream->parent->h2_session, stream->stream_id,
-                      NGHTTP2_CONNECT_ERROR);
-        h2_session_send_and_poll(aTHX_ stream->parent);
-        return;
-    }
-
     /* Swallow initial HTTP/1.1 response for PSGI H2 tunnel transparency.
      * Apps doing psgix.io write "HTTP/1.1 101 Switching...\r\n\r\n" which
      * is meaningful for H1 but must be discarded for H2 tunnels. */
@@ -1851,6 +1864,14 @@ h2_tunnel_sv0_read_cb(EV_P_ struct ev_io *w, int revents)
     }
 
     h2_resp_wbuf_append(stream, buf, nread);
+
+    /* Same cap the TLS relay applies to tls_wbuf: resp_wbuf has no bound of
+     * its own, and a client that stops reading would otherwise accumulate the
+     * whole stream in server memory - which no timeout reaps, because an
+     * established tunnel is exempt from them by design.  Stop pulling from
+     * the app; h2_check_stream_poll_cbs re-arms once the wire catches up. */
+    if (unlikely(h2_resp_wbuf_avail(stream) > FEER_TUNNEL_MAX_WBUF))
+        ev_io_stop(EV_A, &stream->tunnel_read_w);
 
 relay:
     nghttp2_session_resume_data(stream->parent->h2_session, stream->stream_id);
