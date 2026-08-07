@@ -1125,22 +1125,6 @@ tls_parse:
     begin_request_headers(c);
 
     if (likely(c->receiving <= RECEIVE_HEADERS)) {
-        /* Bound the header block BEFORE looking at whether it parsed.  The
-         * check below only ran when parsing returned "need more", so a block
-         * that arrived complete inside one decrypt burst was dispatched
-         * without ever being measured: with max_read_buf=4096 a 30000-byte
-         * header field was served 200 over TLS while the plain twin answered
-         * 431, because the plain path bounds rbuf growth as it reads rather
-         * than after it parses.  Same operator limit, one transport ignoring
-         * it. */
-        if (unlikely(SvCUR(c->rbuf) > c->cached_max_read_buf)) {
-            trace("tls header block too large %d: %"Sz_uf" > %"Sz_uf"\n",
-                c->fd, (Sz)SvCUR(c->rbuf), (Sz)c->cached_max_read_buf);
-            respond_with_server_error(c,
-                "Request header fields too large\n", 431);
-            finish_receiving(c);
-            goto tls_read_cleanup;
-        }
         int parse_ret = try_parse_http(c, (size_t)got_n);
         if (parse_ret == -1) {
             /* Same split the plain twin makes: picohttpparser reports "too many
@@ -1171,7 +1155,19 @@ tls_parse:
             }
             goto tls_read_cleanup;
         }
-        /* Headers complete. parse_ret = body offset */
+        /* Headers complete: parse_ret is the body offset, so it IS the size of
+         * the header block.  Measure that rather than SvCUR - one decrypt
+         * burst commonly carries the body along with the headers, and counting
+         * the whole buffer turned a legitimate 9KB upload into a 431 on TLS
+         * while the plain twin served it 200 under the same max_read_buf. */
+        if (unlikely((STRLEN)parse_ret > c->cached_max_read_buf)) {
+            trace("tls header block too large %d: %"Sz_uf" > %"Sz_uf"\n",
+                c->fd, (Sz)parse_ret, (Sz)c->cached_max_read_buf);
+            respond_with_server_error(c,
+                "Request header fields too large\n", 431);
+            finish_receiving(c);
+            goto tls_read_cleanup;
+        }
         if (!process_request_headers(c, parse_ret))
             finish_receiving(c);
     }

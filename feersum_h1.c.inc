@@ -71,10 +71,14 @@ try_conn_read(EV_P_ ev_io *w, int revents)
     }
     else if (unlikely(space_free < READ_BUFSZ)) {
         size_t cur_len = SvLEN(c->rbuf);
-        // DoS protection: limit buffer growth (especially for chunked encoding)
-        if (unlikely(cur_len + READ_GROW_FACTOR*READ_BUFSZ > c->cached_max_read_buf)) {
+        // DoS protection: limit buffer growth (especially for chunked encoding).
+        // Bound on what is BUFFERED, not on where the next 16K step would land:
+        // the step alone tripped this on the very first grow for any
+        // max_read_buf under ~20K, pinning the real cap at READ_BUFSZ however
+        // the operator configured it, while the TLS twin honoured the value.
+        if (unlikely(SvCUR(c->rbuf) > c->cached_max_read_buf)) {
             trace("buffer too large %d: %"Sz_uf" > %"Sz_uf"\n",
-                w->fd, (Sz)cur_len, (Sz)c->cached_max_read_buf);
+                w->fd, (Sz)SvCUR(c->rbuf), (Sz)c->cached_max_read_buf);
             // Tear down the read side only, so the queued response can still
             // drain: stop_all_watchers would drop it under backpressure.
             // Still in the header block means the FIELDS are oversized, so 431
@@ -89,7 +93,7 @@ try_conn_read(EV_P_ ev_io *w, int revents)
         trace("moar memory %d: %"Sz_uf" to %"Sz_uf"\n",
             w->fd, (Sz)SvLEN(c->rbuf), (Sz)new_len);
         SvGROW(c->rbuf, new_len);
-        space_free += READ_GROW_FACTOR*READ_BUFSZ;
+        space_free = (ssize_t)(SvLEN(c->rbuf) - SvCUR(c->rbuf));
     }
 
     char *cur = SvPVX(c->rbuf) + SvCUR(c->rbuf);
@@ -170,6 +174,17 @@ try_parse:
         }
 #endif
 
+        /* Bound the header block where the TLS twin does, on `ret` - the body
+         * offset, which IS the header block size.  The growth check above only
+         * fires once the buffer runs out of space, so a block could overshoot
+         * max_read_buf by a whole 16K step and still be served here while TLS
+         * answered 431 for the same bytes. */
+        if (unlikely((STRLEN)ret > c->cached_max_read_buf)) {
+            trace("header block too large %d: %"Sz_uf" > %"Sz_uf"\n",
+                w->fd, (Sz)ret, (Sz)c->cached_max_read_buf);
+            respond_with_server_error(c, "Request header fields too large\n", 431);
+            goto dont_read_again;
+        }
         if (process_request_headers(c, ret))
             goto try_read_again_reset_timer;
         else
