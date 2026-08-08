@@ -72,19 +72,35 @@ sub _read_n {
     return $buf;
 }
 
+# A frame still in flight must never come back looking complete.  _read_n stops
+# at the deadline and returns what it has, so a frame split across the timeout
+# used to yield a short payload with no error, and the leftover bytes were then
+# parsed as the next frame header - desynchronising the connection silently.
+# The caller's timeout decides whether a frame STARTS; once one has, finish it
+# against a generous deadline and die rather than hand back a truncated frame.
+use constant FRAME_FINISH_TIMEOUT => 10 * TIMEOUT_MULT;
+
 sub h2_read_frame {
     my ($sock, $timeout) = @_;
     $timeout //= 5 * TIMEOUT_MULT;
-    my $deadline = time + $timeout;
 
-    my $hdr = _read_n($sock, 9, $deadline);
-    return undef if length($hdr) < 9;
+    my $hdr = _read_n($sock, 9, time + $timeout);
+    return undef if length($hdr) == 0;   # nothing arrived: a clean miss
+    if (length($hdr) < 9) {
+        $hdr .= _read_n($sock, 9 - length($hdr), time + FRAME_FINISH_TIMEOUT);
+        die sprintf "h2_read_frame: truncated frame header, %d of 9 bytes\n",
+            length $hdr if length($hdr) < 9;
+    }
 
     my ($len_hi, $len_lo, $type, $flags, $stream_id) = unpack('CnCCN', $hdr);
     my $len = ($len_hi << 16) | $len_lo;
     $stream_id &= 0x7FFFFFFF;
 
-    my $payload = _read_n($sock, $len, $deadline);
+    my $payload = $len ? _read_n($sock, $len, time + FRAME_FINISH_TIMEOUT) : '';
+    die sprintf "h2_read_frame: truncated payload, %d of %d bytes "
+              . "(type=%d stream=%d)\n", length($payload), $len, $type, $stream_id
+        if length($payload) < $len;
+
     return { type => $type, flags => $flags, stream_id => $stream_id,
              payload => $payload, length => $len };
 }
