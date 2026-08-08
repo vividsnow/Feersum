@@ -429,8 +429,10 @@ safe_close_conn(struct feer_conn *c, const char *where)
     // drain, send nothing - an undecryptable alert is worse than none.
     if (c->tls && c->tls_handshake_done && c->tls_wbuf.off > 0)
         (void)feer_tls_flush_wbuf(c);
-    if (c->tls && c->tls_handshake_done && c->tls_wbuf.off == 0) {
+    if (c->tls && c->tls_handshake_done && c->tls_wbuf.off == 0
+        && !c->tls_alert_sent) {
         ptls_buffer_t closebuf;
+        c->tls_alert_sent = 1;
         ptls_buffer_init(&closebuf, "", 0);
         if (unlikely(c->tls_fatal_alert))
             ptls_send_alert(c->tls, &closebuf, PTLS_ALERT_LEVEL_FATAL,
@@ -449,6 +451,14 @@ safe_close_conn(struct feer_conn *c, const char *where)
     // Graceful TCP shutdown: send FIN to peer before close
     // This ensures client sees clean EOF instead of RST
     shutdown(c->fd, SHUT_WR);
+
+    /* The alert and FIN are queued behind the response now, but the response
+     * is only in the kernel, not delivered.  Closing here while a routine
+     * client frame (a WINDOW_UPDATE for the DATA just sent) is unread makes
+     * the kernel answer RST and drop the queued response.  Hold the fd open
+     * and drain until the peer EOFs or the deadline fires. */
+    if (unlikely(c->want_linger_close) && feer_arm_linger(c, where))
+        return;
 
     if (unlikely(close(c->fd) < 0))
         trouble("close(%s) fd=%d: %s\n", where, c->fd, strerror(errno));
@@ -1058,6 +1068,38 @@ feer_linger_close(struct feer_conn *c, const char *where)
         return;
     }
     feer_shutdown_conn(c, where);
+}
+
+/* Lingering for the shutdown-close of a TLS/H2 connection.  feer_linger_close
+ * excludes that path on purpose - it must not hold an fd and a max_connections
+ * slot for a whole linger_timeout while the server is trying to exit - so this
+ * arms the same drain on a socket safe_close_conn has already sent the alert
+ * and FIN on, with a short cap of its own.  Returns 1 if the fd is now held. */
+static int
+feer_arm_linger(struct feer_conn *c, const char *where)
+{
+    double cap = c->server->linger_timeout;
+    if (c->fd < 0 || c->closing_linger)
+        return 0;
+    if (cap <= 0.0 || cap > FEER_SHUTDOWN_LINGER_MAX)
+        cap = FEER_SHUTDOWN_LINGER_MAX;
+
+    trace("shutdown linger begin fd=%d (%s)\n", c->fd, where);
+    c->want_linger_close = 0;   /* one attempt: the drain's close is the real one */
+    c->closing_linger = 1;
+    c->linger_left = LINGER_MAX_BYTES;
+    stop_all_watchers(c);
+    change_receiving_state(c, RECEIVE_SHUTDOWN);
+    ev_io_init(&c->read_ev_io, linger_read_cb, c->fd, EV_READ);
+    ev_set_priority(&c->read_ev_io, c->server->read_priority);
+    c->read_ev_io.data = (void *)c;
+    start_read_watcher(c);
+    ev_timer_init(&c->read_ev_timer, linger_timeout_cb, cap, 0.0);
+    ev_set_priority(&c->read_ev_timer, c->server->read_priority);
+    c->read_ev_timer.data = (void *)c;
+    ev_timer_start(feersum_ev_loop, &c->read_ev_timer);
+    SvREFCNT_inc_void_NN(c->self);
+    return 1;
 }
 
 static void

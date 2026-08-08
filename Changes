@@ -108,6 +108,13 @@ Revision history for Perl extension Feersum
           header with an underscore ("Content_Length:"). the special case only
           matched the dashed spelling while name normalisation maps both to the
           same key, so the underscore form reached the ordinary HTTP_ path
+        - a retiring worker (max_requests_per_worker, which Feersum::Runner
+          uses) or a graceful shutdown no longer loses the last http/2
+          response. the close ran as soon as the response reached the kernel,
+          and a client WINDOW_UPDATE for that very response is normally still
+          unread at that moment, so the kernel answered RST and discarded the
+          response it had already accepted. the app had been told it was sent.
+          that close now lingers briefly, draining until the peer closes
         - return_from_io()/return_from_psgix_io() now take a private duplicate
           of the descriptor instead of leaving the app's handle and feersum
           both owning one number. releasing the handle at the end of the

@@ -89,6 +89,9 @@
  * LINGER_TIMEOUT seconds total, LINGER_MAX_BYTES drained. */
 #define LINGER_TIMEOUT 5.0
 #define LINGER_MAX_BYTES (256 * 1024)
+/* Cap for the shutdown-path linger: long enough for the peer to answer the
+ * FIN on a healthy link, short enough not to stall a retiring worker. */
+#define FEER_SHUTDOWN_LINGER_MAX 0.5
 /* Paced re-invitation of a write poll_cb that declined (wrote nothing):
  * MIN * 2^backoff, clamped to MAX; backoff capped so the shift stays sane. */
 #define FEER_POLL_RETRY_MIN 0.001
@@ -401,6 +404,12 @@ struct feer_conn {
     /* A raw takeover's IO handle SHARES c->fd, so only it may close it.  Not
      * io_taken: that is also set for tunnels, where Feersum keeps c->fd. */
     unsigned int fd_given_away:1;
+    /* close_notify already written, so the linger's eventual real close does
+     * not encrypt a second alert onto a socket that is half shut down. */
+    unsigned int tls_alert_sent:1;
+    /* Close this one by lingering: the response reached the kernel only just
+     * now, and closing on top of an unread client frame answers RST. */
+    unsigned int want_linger_close:1;
     unsigned int proxy_proto_version:2;
     unsigned int proxy_ssl:1;
     /* In a lingering close: FIN already sent via shutdown(SHUT_WR), read side
@@ -789,6 +798,7 @@ static void handle_keepalive_or_close(struct feer_conn *c, conn_read_cb_t read_c
 static void feer_emit_access_log(pTHX_ struct feer_conn *c);
 static void safe_close_conn(struct feer_conn *c, const char *where);
 static void feer_linger_close(struct feer_conn *c, const char *where);
+static int  feer_arm_linger(struct feer_conn *c, const char *where);
 static int prep_socket(int fd, int is_tcp);
 static void set_cork(struct feer_conn *c, int cork);
 static void feersum_init_psgi_env_constants(pTHX);

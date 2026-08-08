@@ -1054,6 +1054,9 @@ feer_h2_session_send(struct feer_conn *c)
      * buffer is not empty yet, try_tls_conn_write finishes the job. */
     if (unlikely(c->h2_close_pending) && c->tls_wbuf.off == 0) {
         c->h2_close_pending = 0;
+        /* Linger: the response is in the kernel, not delivered, and the
+         * client WINDOW_UPDATE for it is typically unread right now. */
+        c->want_linger_close = 1;
         feer_shutdown_conn(c, "last H2 stream closed during shutdown");
     }
 

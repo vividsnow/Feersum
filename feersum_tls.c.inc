@@ -1277,6 +1277,9 @@ try_tls_conn_write(EV_P_ ev_io *w, int revents)
      * response has only now reached the wire. */
     if (unlikely(c->h2_close_pending) && c->tls_wbuf.off == 0) {
         c->h2_close_pending = 0;
+        /* Linger: the response is in the kernel, not delivered, and the
+         * client WINDOW_UPDATE for it is typically unread right now. */
+        c->want_linger_close = 1;
         feer_shutdown_conn(c, "last H2 stream closed during shutdown");
         goto tls_write_cleanup;
     }
