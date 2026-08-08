@@ -823,7 +823,11 @@ sub _run_hot_restart_master { ## no critic (ProhibitExcessComplexity)
                     $gt += DEATH_TIMER_INCR;  # outlast the workers' deadline
                 }
                 else {
-                    $f->graceful_shutdown(sub { POSIX::_exit(0) });
+                    # Guarded as quit() is: a generation already draining a
+                    # retirement croaks "already shutting down" here, and the
+                    # croak skipped $death_w below, so this generation lost its
+                    # deadline and the master force-KILLed the group, exit 1.
+                    eval { $f->graceful_shutdown(sub { POSIX::_exit(0) }); 1 };
                 }
                 $death_w = EV::timer($gt, 0, sub {
                     # Take this generation's workers with us, as the cold-start
