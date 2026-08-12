@@ -33,7 +33,7 @@ my $APP = <<'EOAPP';
 EOAPP
 
 my $app = eval $APP;
-ok $app, 'got an app' || diag $@;
+ok $app, 'got an app' or diag $@;
 $evh->psgi_request_handler($app);
 
 my $cv = AE::cv;

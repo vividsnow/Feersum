@@ -1,12 +1,14 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use Test::More;
 use utf8;
 use lib 't'; use Utils;
 
 BEGIN {
-    plan skip_all => 'no applicable on win32'
+    plan skip_all => 'not applicable on win32'
         if $^O eq 'MSWin32';
     plan skip_all => "Need Test::SharedFork >=0.25 to run this test"
         unless eval 'require Test::SharedFork; $Test::SharedFork::VERSION >= 0.25';
@@ -63,9 +65,9 @@ if ($pid == 0) { # child
             $hdl->destroy;
             $cv->send;
         },
-        timeout => 5
+        timeout => 3 * TIMEOUT_MULT
     );
-    $hdl->push_write("GET / HTTP/1.1\015\012\015\012");
+    $hdl->push_write("GET / HTTP/1.1\015\012Host: localhost\015\012\015\012");
     $hdl->push_read(line => sub {
         is $_[1], 'HTTP/1.1 200 OK', 'got reply';
         $cv->send;

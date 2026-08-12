@@ -1,6 +1,8 @@
 #!perl
 use warnings;
 use strict;
+# TIMEOUT_MULT allows scaling all timing values for slow machines (default: 1)
+use constant TIMEOUT_MULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use constant CLIENTS => $ENV{RELEASE_TESTING} ? 10 : 2;
 use constant ROUNDS => $ENV{RELEASE_TESTING} ? 25 : 4;
 use Scalar::Util qw/refaddr/;
@@ -105,7 +107,7 @@ for my $round (1..ROUNDS) {
         $cv->begin;
         my $h = AnyEvent::Handle->new(
             connect => ['127.0.0.1',$port],
-            timeout => 3,
+            timeout => 2 * TIMEOUT_MULT,
         );
         $cs_handles[$n] = $h;
         $h->{guard} = guard { pass "client setup: $n destroyed" };
@@ -118,6 +120,7 @@ for my $round (1..ROUNDS) {
         });
 
         $h->push_write("GET / HTTP/1.1$CRLF".
+            "Host: localhost$CRLF".
             "Upgrade: chatz$CRLF".
             "X-Client: $n$CRLF".
             $CRLF.
@@ -132,13 +135,18 @@ for my $round (1..ROUNDS) {
             $connect_cv->end;
         });
         my $to_read = CLIENTS;
+        my %senders;
         $h->push_read(line => sub {
             my $line = $_[1];
             $to_read--;
             like $line, qr/^hello from \d+$/,
                 "client msg: $n got a chat, $to_read left";
+            $senders{$1}++ if $line =~ /^hello from (\d+)$/;
             unless ($to_read) {
-                pass "client setup: client $n is done";
+                # Shape alone passed even if one sender's message arrived twice
+                # and another's was dropped.
+                is scalar(keys %senders), CLIENTS,
+                    "client $n heard from all " . CLIENTS . " distinct senders";
                 $cv->end;
             }
         }) for (1 .. CLIENTS);
@@ -157,4 +165,4 @@ for my $round (1..ROUNDS) {
 }
 
 pass "all done";
-done_testing;
+

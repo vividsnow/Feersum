@@ -1,5 +1,49 @@
 Revision history for Perl extension Feersum
 
+1.507
+        New:
+        - multiple server instances (new_instance) and multiple listeners
+          per instance, IPv6 among them
+        - TLS 1.3 via picotls+openssl: per-listener certificates, SNI vhosts
+        - HTTP/2 via nghttp2: multiplexing, streaming, extended CONNECT
+          (RFC 8441), rapid-reset protection (CVE-2023-44487)
+        - PROXY protocol v1/v2, including TLVs
+        - reverse_proxy mode: take client_address and url_scheme from
+          X-Forwarded-For/-Proto behind a trusted upstream; off by default
+        - SO_REUSEPORT, sendfile, UNIX-socket listeners
+        - timeouts and limits: header_timeout, read_timeout, write_timeout,
+          linger_timeout, max_connections, max_body_len, max_uri_len,
+          max_read_buf, max_accept_per_loop, max_h2_concurrent_streams,
+          wbuf_low_water, max_connection_reqs
+        - introspection: active_conns, total_requests, access_log,
+          pause_accept/resume_accept, set_psgix_io
+        - psgix.h2.trailers, psgix.h2.extended_connect, psgix.h2.protocol,
+          psgix.proxy_tlvs
+        - psgi.input gains getline, getlines and <$fh>
+        - Feersum::Runner: hot_restart, pre_fork, preload_app, daemonize,
+          pid_file, user/group, after_fork, access_log, graceful_timeout,
+          startup_timeout, max_requests_per_worker
+        - bin/feersum native mode with full Runner option parity
+        - about 32% more PSGI throughput than 1.505, 60% more on the
+          native interface (h2load, keepalive, loopback)
+
+        Incompatible with 1.505:
+        - requires Perl 5.14 (was 5.8.7)
+        - the Feersum object is no longer a hashref; use the public API
+        - psgix.input.buffered is no longer advertised.  It promises a
+          rewindable handle and psgi.input is forward-only; unset, Plack
+          buffers the body itself and every read ordering works
+        - a UTF8-flagged response string whose characters all fit in a byte
+          is sent as those bytes, matching every other PSGI server
+        - a 1xx final response status is refused (101 stays legal), and a
+          status above 599 answers 500
+        - response headers and status lines carrying CR, LF, NUL or other
+          control characters are refused (CWE-113)
+        - psgi.input is always present, per PSGI 1.1
+
+        See the UPGRADING section in the Feersum docs for behaviour changes
+        that need no code change to bite.
+
 1.505 Wed Apr 09 16:20:00 2025 -0200
         - pipeline fix
         - minor: manifest fix and test tweaks

@@ -1,7 +1,6 @@
 #!perl
 use strict;
 use Test::More;
-use blib;
 use lib 't'; use Utils;
 BEGIN {
     $ENV{PLACK_TEST_IMPL} = 'Server';
@@ -15,13 +14,11 @@ BEGIN {
 plan tests => 6;
 
 use Plack::Test;
-use Plack::Test;
 use Plack::Builder;
 use Plack::App::File;
 use Plack::App::Cascade;
 use Plack::Request;
 use Plack::LWPish;
-use Test::TCP;
 
 via_map: test_psgi(
     app => builder {
