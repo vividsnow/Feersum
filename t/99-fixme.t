@@ -26,7 +26,17 @@ foreach my $MODULE ( @MODULES ) {
 	}
 }
 
-run_tests(where => [qw(lib bin eg t)],
-    match => qr/[T]ODO|[F]IXME|[X]XX/);
+run_tests(
+    where => [qw(lib bin eg t xt),
+              glob('feersum_*.c.inc feersum_*.h *.xs rinq.c')],
+    match => qr/[T]ODO|[F]IXME|[X]XX/,
+    # Scan hand-written source only. Keep the extensionless bin/feersum script,
+    # .feersum examples, and the root C/XS/inc/header implementation. Skip
+    # generated/compiled artifacts: the xsubpp-generated Feersum.c (excluded
+    # from `where` - only rinq.c is globbed, not *.c) and eg/ sub-dist
+    # .c/.o/.so/.bs/Makefile (never match the extension list).
+    filename_match =>
+        qr/\.(?:pm|pl|pod|psgi|t|xs|PL|c\.inc)$|feersum_\w+\.h$|(?:^|\/)rinq\.c$|feersum$/i,
+);
 
 1;

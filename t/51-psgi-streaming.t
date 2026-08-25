@@ -59,7 +59,7 @@ my $APP = <<'EOAPP';
 EOAPP
 
 my $app = eval $APP;
-ok $app, 'got an app' || diag $@;
+ok $app, 'got an app' or diag $@;
 $evh->psgi_request_handler($app);
 
 returning_body: {
@@ -105,7 +105,7 @@ my $APP2 = <<'EOAPP';
 EOAPP
 
 my $app2 = eval $APP2;
-ok $app2, 'got app 2' || diag $@;
+ok $app2, 'got app 2' or diag $@;
 $evh->psgi_request_handler($app2);
 
 using_writer: {
