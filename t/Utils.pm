@@ -12,6 +12,7 @@ use AnyEvent ();
 use AnyEvent::Handle ();
 use Guard ();
 use Scalar::Util qw/blessed weaken/;
+use Time::HiRes ();
 use utf8;
 
 $SIG{PIPE} = 'IGNORE';
@@ -35,6 +36,9 @@ sub import {
     *{$pkg.'::tls_client_ok'} = \&tls_client_ok;
     *{$pkg.'::reap_server'} = \&reap_server;
     *{$pkg.'::run_capped'} = \&run_capped;
+    *{$pkg.'::tls_probe'} = \&tls_probe;
+    *{$pkg.'::require_tls_throughput'} = \&require_tls_throughput;
+    *{$pkg.'::require_tls_handshake_under'} = \&require_tls_handshake_under;
 
     return 1;
 }
@@ -349,6 +353,111 @@ sub build_proxy_v2 {
 sub tls_client_ok {
     eval { require Net::SSLeay; 1 } or return 0;
     return Net::SSLeay::SSLeay() >= 0x10101000; # OpenSSL >= 1.1.1 for TLS 1.3 client
+}
+
+# Loopback TLS probe: bulk throughput in MB/s, plus what one handshake costs.
+#
+# A deadline test states its premise in time - "this reply spans several write
+# deadlines", "the handshake fits inside read_timeout".  A box too slow to hold
+# that premise gets reaped mid-transfer and false-fails, which says nothing
+# about the server.  Gate such tests on measured capability, never on the
+# platform name: one armv6l smoker measured 0.8 MB/s where CI boxes measure
+# hundreds, and it is the same test code either way.
+#
+# The transfer is bounded by bytes AND wall clock, so a slow box finishes the
+# probe quickly by simply moving less of it.  undef means the probe could not
+# run at all; callers then run the test rather than skip it blind.
+my $tls_probe_cache;
+my $tls_probe_done = 0;
+sub tls_probe {
+    return $tls_probe_cache if $tls_probe_done;
+    $tls_probe_done = 1;
+    return $tls_probe_cache = _tls_probe();
+}
+
+sub _tls_probe {
+    my ($cert, $key);
+    for my $pair (['t/certs/alpha.crt', 't/certs/alpha.key'],
+                  ['eg/ssl-proxy/server.crt', 'eg/ssl-proxy/server.key']) {
+        next unless -r $pair->[0] && -r $pair->[1];
+        ($cert, $key) = @$pair;
+        last;
+    }
+    return undef unless $cert;
+    return undef unless eval { require IO::Socket::SSL; 1 };
+    my $tmult = $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
+    # get_listen_socket moves $last_port, which simple_client falls back to:
+    # restore it, or probing would aim a later client at this closed port
+    local $last_port = $last_port;
+    my ($lsock, $lport) = get_listen_socket();
+    return undef unless $lsock;
+    my $cap_bytes = 8 * 1024 * 1024;
+    my $cap_secs  = 1.5 * $tmult;
+    my $pid = fork();
+    return undef unless defined $pid;
+    if (!$pid) {
+        $SIG{QUIT} = 'DEFAULT';
+        $lsock->blocking(1);
+        my $c = $lsock->accept;
+        if ($c && IO::Socket::SSL->start_SSL($c, SSL_server => 1,
+                SSL_cert_file => $cert, SSL_key_file => $key)) {
+            my $chunk = 'D' x 65536;
+            my $left = $cap_bytes;
+            while ($left > 0) {
+                my $n = syswrite($c, $chunk, $left < 65536 ? $left : 65536);
+                last unless $n;
+                $left -= $n;
+            }
+        }
+        close $c if $c;
+        POSIX::_exit(0);
+    }
+    close $lsock;
+    my %out;
+    eval {
+        local $SIG{ALRM} = sub { die "probe timeout\n" };
+        alarm 30 * $tmult;
+        my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $lport,
+            Proto => 'tcp', Timeout => 5 * $tmult) or die "connect: $!\n";
+        my $t0 = Time::HiRes::time();
+        IO::Socket::SSL->start_SSL($c, SSL_verify_mode => 0) or die "handshake failed\n";
+        $out{handshake_s} = Time::HiRes::time() - $t0;
+        my ($got, $start) = (0, Time::HiRes::time());
+        while ($got < $cap_bytes) {
+            my $n = sysread($c, my $part, 65536);
+            last unless $n;
+            $got += $n;
+            last if Time::HiRes::time() - $start >= $cap_secs;
+        }
+        my $elapsed = Time::HiRes::time() - $start;
+        close $c;
+        $out{mb_per_s} = ($elapsed > 0 && $got) ? ($got / 1048576) / $elapsed : 0;
+        alarm 0;
+    };
+    reap_server($pid, 5);
+    return undef unless defined $out{handshake_s};
+    $out{mb_per_s} //= 0;   # handshake worked but nothing moved: too slow, not unmeasurable
+    return \%out;
+}
+
+sub require_tls_throughput {
+    my ($need, $why) = @_;
+    my $p = tls_probe() or return;
+    Test::More::plan(skip_all => sprintf
+        'TLS throughput %.1f MB/s under the %.1f MB/s %s needs',
+        $p->{mb_per_s}, $need, $why) if $p->{mb_per_s} < $need;
+    Test::More::diag sprintf 'TLS loopback throughput ~%.1f MB/s (need ~%.1f)',
+        $p->{mb_per_s}, $need;
+    return $p;
+}
+
+sub require_tls_handshake_under {
+    my ($budget, $why) = @_;
+    my $p = tls_probe() or return;
+    Test::More::plan(skip_all => sprintf
+        'one TLS handshake costs %.2fs, over the %.2fs %s allows',
+        $p->{handshake_s}, $budget, $why) if $p->{handshake_s} > $budget;
+    return $p;
 }
 
 sub run_client {

@@ -74,10 +74,23 @@ feer_determine_url_scheme(pTHX_ struct feer_conn *c)
 
 static HV *psgi_env_template = NULL;
 
+/* pinned, or PL_strtab allocates and frees these key HEKs every request */
+static HV *psgi_key_pin = NULL;
+static const char * const psgi_pinned_keys[] = {
+    "SERVER_NAME", "SERVER_PORT", "REQUEST_URI", "REQUEST_METHOD",
+    "SERVER_PROTOCOL", "REMOTE_ADDR", "REMOTE_PORT", "psgi.url_scheme",
+    "CONTENT_LENGTH", "CONTENT_TYPE", "psgi.input", "psgi.multiprocess",
+    "PATH_INFO", "QUERY_STRING", "psgix.io", "HTTP_HOST",
+    NULL
+};
+
 static void
 feersum_init_psgi_env_constants(pTHX)
 {
     if (psgi_env_version) return;
+    psgi_key_pin = newHV();
+    for (const char * const *k = psgi_pinned_keys; *k; k++)
+        (void)hv_store(psgi_key_pin, *k, (I32)strlen(*k), &PL_sv_undef, 0);
     psgi_env_version = newRV((SV*)psgi_ver);
     psgi_env_errors = newRV((SV*)PL_stderrgv);
 
@@ -189,8 +202,7 @@ feersum_env(pTHX_ struct feer_conn *c)
      * takes the socket, so a native handler must never be handed one. */
     if (c->server->request_cb_is_psgi && c->server->psgix_io) {
         SV *fake_fh = newSViv(c->fd);
-        SV *selfref = sv_2mortal(feer_conn_2sv(c));
-        sv_magicext(fake_fh, selfref, PERL_MAGIC_ext, &psgix_io_vtbl, NULL, 0);
+        sv_magicext(fake_fh, c->self, PERL_MAGIC_ext, &psgix_io_vtbl, NULL, 0);
         hv_stores(e, "psgix.io", fake_fh);
     }
 
@@ -205,9 +217,19 @@ feersum_env(pTHX_ struct feer_conn *c)
         hv_stores(e, "psgix.proxy_tlvs", newRV_noinc((SV *)copy));
     }
 
-    if (likely(!r->path)) feersum_set_path_and_query(aTHX_ r);
-    hv_stores(e, "PATH_INFO", feer_copy_pv(aTHX_ r->path));
-    hv_stores(e, "QUERY_STRING", feer_copy_pv(aTHX_ r->query));
+    if (likely(!r->path)) {
+        /* no native accessor cached them: hand the fresh SVs to the env */
+        feersum_set_path_and_query(aTHX_ r);
+        SV *q = r->query;
+        hv_stores(e, "PATH_INFO", r->path);
+        r->path = NULL;
+        r->query = NULL;
+        if (q == empty_query_sv) { SvREFCNT_dec(q); q = newSVpvs(""); }
+        hv_stores(e, "QUERY_STRING", q);
+    } else {
+        hv_stores(e, "PATH_INFO", feer_copy_pv(aTHX_ r->path));
+        hv_stores(e, "QUERY_STRING", feer_copy_pv(aTHX_ r->query));
+    }
 
     char *kbuf = header_key_buf; // already holds the "HTTP_" prefix
 
@@ -313,29 +335,71 @@ feersum_env(pTHX_ struct feer_conn *c)
     return e;
 }
 
+/* EMPTY_HE: no placeholder value SV per header */
+#ifdef HV_FETCH_EMPTY_HE
+# define FEER_HE_LVAL_FLAGS (HV_FETCH_LVALUE|HV_FETCH_EMPTY_HE)
+# define FEER_HE_IS_NEW(he) (HeVAL(he) == NULL)
+#else
+# define FEER_HE_LVAL_FLAGS HV_FETCH_LVALUE
+# define FEER_HE_IS_NEW(he) (!SvOK(HeVAL(he)))
+#endif
+
 #define COPY_NORM_HEADER(_str) \
 for (i = 0; i < r->num_headers; i++) {\
     struct phr_header *hdr = &(r->headers[i]);\
     if (unlikely(hdr->name_len > MAX_HEADER_NAME_LEN)) continue;\
     char *k = kbuf;\
     for (j = 0; j < hdr->name_len; j++) { char n = hdr->name[j]; *k++ = _str; }\
-    SV** val = hv_fetch(e, kbuf, hdr->name_len, 1);\
-    if (unlikely(!val)) continue;\
-    if (unlikely(SvPOK(*val))) {\
+    HE *he = (HE *)hv_common(e, NULL, kbuf, hdr->name_len, 0,\
+        FEER_HE_LVAL_FLAGS, NULL, 0);\
+    if (unlikely(!he)) continue;\
+    if (likely(FEER_HE_IS_NEW(he))) {\
+        SvREFCNT_dec(HeVAL(he));\
+        HeVAL(he) = newSVpvn(hdr->value, hdr->value_len);\
+    } else {\
         const char *sep = (hdr->name_len == 6\
             && str_case_eq_fixed("cookie", hdr->name, 6)) ? "; " : ", ";\
-        sv_catpvn(*val, sep, 2);\
-        sv_catpvn(*val, hdr->value, hdr->value_len);\
-    } else {\
-        sv_setpvn(*val, hdr->value, hdr->value_len);\
+        sv_catpvn(HeVAL(he), sep, 2);\
+        sv_catpvn(HeVAL(he), hdr->value, hdr->value_len);\
     }\
 }\
 break;
+
+/* common header names in every normalization, pinned like psgi_key_pin */
+static HV *hdr_key_pin = NULL;
+static const char * const hdr_pinned_names[] = {
+    "Host", "Connection", "Accept", "Accept-Encoding", "Accept-Language",
+    "User-Agent", "Cookie", "Referer", "Content-Type", "Content-Length",
+    "Cache-Control", "Upgrade-Insecure-Requests", "If-None-Match",
+    "If-Modified-Since", "Origin", "Authorization", "Pragma", "Range",
+    "X-Forwarded-For", "X-Forwarded-Proto", "X-Requested-With",
+    "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-User", "Sec-Fetch-Dest",
+    NULL
+};
+
+static void
+feersum_init_hdr_key_pin(pTHX)
+{
+    static const unsigned char * const maps[] = {
+        NULL, ascii_lower, ascii_upper, ascii_lower_dash, ascii_upper_dash
+    };
+    char buf[64];
+    hdr_key_pin = newHV();
+    for (const char * const *n = hdr_pinned_names; *n; n++) {
+        size_t len = strlen(*n);
+        for (size_t m = 0; m < sizeof(maps) / sizeof(maps[0]); m++) {
+            for (size_t k = 0; k < len; k++)
+                buf[k] = maps[m] ? (char)maps[m][(unsigned char)(*n)[k]] : (*n)[k];
+            (void)hv_store(hdr_key_pin, buf, (I32)len, &PL_sv_undef, 0);
+        }
+    }
+}
 
 static HV*
 feersum_env_headers(pTHX_ struct feer_req *r, int norm)
 {
     size_t i; size_t j; HV* e;
+    if (unlikely(!hdr_key_pin)) feersum_init_hdr_key_pin(aTHX);
     e = newHV();
     if (r->num_headers > 0)
         hv_ksplit(e, r->num_headers);
@@ -1943,7 +2007,7 @@ psgix_io_svt_get (pTHX_ SV *sv, MAGIC *mg)
 {
     dSP;
 
-    struct feer_conn *c = sv_2feer_conn(mg->mg_obj);
+    struct feer_conn *c = (struct feer_conn *)SvPVX(mg->mg_obj);
     trace("invoking psgix.io magic for fd=%d\n", c->fd);
 
     sv_unmagic(sv, PERL_MAGIC_ext);

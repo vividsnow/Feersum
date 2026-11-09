@@ -444,7 +444,10 @@ jobs:
   # action and the runner's x86_64 node cannot exec inside a linux/386 image.
   linux-i386:
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-26.04 a native i386 container cannot resolve DNS (the
+    # same commit passed on 24.04 and failed on 26.04), while the QEMU-run
+    # arm32 job below is unaffected.  Check that before moving this forward.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
     steps:
@@ -458,7 +461,11 @@ jobs:
             i386/debian:stable sh -s <<'EOS'
           set -e
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq
+          # An update that reached no mirror still exits 0, and every install
+          # then fails with "Unable to locate package", which reads as packages
+          # having been removed rather than as the DNS failure it actually was.
+          # Error-Mode=any makes that fetch warning the failure it is.
+          apt-get update -qq -o APT::Update::Error-Mode=any
           apt-get install -y -qq perl gcc make libssl-dev libnghttp2-dev cpanminus \
             libev-perl libanyevent-perl libguard-perl libtest-fatal-perl \
             libio-socket-ssl-perl libtest-tcp-perl libjson-xs-perl \

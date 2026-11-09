@@ -12,6 +12,7 @@ int feer_req_freelist_count = 0;
 HV *feer_stash, *feer_conn_stash;
 HV *feer_conn_reader_stash = NULL, *feer_conn_writer_stash = NULL;
 MGVTBL psgix_io_vtbl;
+MGVTBL feer_handle_vtbl;
 struct feer_server *default_server = NULL;
 struct ev_loop *feersum_ev_loop = NULL;
 ev_timer date_timer;

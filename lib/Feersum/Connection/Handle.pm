@@ -214,9 +214,9 @@ PSGI env hash (L<Twiggy> supports this too, for example).
 
 B<Zero-copy: do not modify a scalar after passing it to C<write()>.>  Feersum
 keeps a reference to your scalar and points the pending C<writev()> at its
-string buffer, and transmission happens I<after> your handler (or callback)
-returns, so modifying the scalar in the meantime changes, or frees, the memory
-about to be sent:
+string buffer, and transmission happens I<after> your handler or callback
+(including your own timers and watchers) returns, so modifying the scalar in
+the meantime changes, or frees, the memory about to be sent:
 
     # WRONG - all five chunks arrive as "line 5"
     my $line;

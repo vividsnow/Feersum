@@ -10,6 +10,7 @@ use Test::More;
 use lib 't'; use Utils;
 use File::Temp qw(tempdir);
 use IO::Socket::INET;
+use Socket qw(SOL_SOCKET SO_SNDBUF SO_RCVBUF);
 use POSIX ();
 use Feersum;
 
@@ -35,9 +36,16 @@ my $nsrv = 0;
 # back into force once the app has let go of the socket.  Each server gets its
 # own write_timeout so the drain cases are not racing it.
 sub spawn_server {
-    my ($write_timeout, $want) = @_;
+    my ($write_timeout, $want, $sndbuf) = @_;
     $want //= $WANT;
     my ($lsock, $lport) = get_listen_socket();
+    # A peer that stops reading only strands a write the buffers cannot swallow:
+    # OpenBSD's defaults absorb the whole reply, leaving the deadline nothing to
+    # reap and the test asserting the opposite of what it meant.
+    if ($sndbuf) {
+        setsockopt($lsock, SOL_SOCKET, SO_SNDBUF, pack('i', $sndbuf))
+            or die "SO_SNDBUF: $!";
+    }
     my $tag = 'srv' . ++$nsrv;
     my $pid = fork();
     die "fork: $!" unless defined $pid;
@@ -129,12 +137,18 @@ reap_server($server);
     # all of it and reach its close without being paused, so that what the
     # deadline has to reap is a connection whose app end is already gone.
     my $small = 8 * 1024 * 1024;
-    my ($srv2, $port2) = spawn_server($deadline, $small);
+    my ($srv2, $port2) = spawn_server($deadline, $small, 32768);
     ok $srv2, 'second server started (write_timeout enabled)';
     select undef, undef, undef, 1 * TIMEOUT_MULT;
 
-    my $s = IO::Socket::SSL->new(PeerAddr => "127.0.0.1:$port2",
-        SSL_verify_mode => 0, Timeout => 10 * TIMEOUT_MULT);
+    # pin the receive buffer before connect: post-connect does not stop
+    # autosizing, and an autosized buffer swallows the reply the stall needs
+    my $s = IO::Socket::INET->new(Proto => 'tcp', Timeout => 10 * TIMEOUT_MULT);
+    if ($s) {
+        setsockopt($s, SOL_SOCKET, SO_RCVBUF, pack('i', 32768)) or die "SO_RCVBUF: $!";
+        $s = $s->connect(Socket::pack_sockaddr_in($port2, Socket::inet_aton('127.0.0.1')))
+            ? IO::Socket::SSL->start_SSL($s, SSL_verify_mode => 0) : undef;
+    }
     ok $s, 'stalling client connected';
     my $got = 0;
     if ($s) {

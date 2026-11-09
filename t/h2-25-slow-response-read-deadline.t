@@ -24,11 +24,16 @@ plan skip_all => 'no test certificates' unless -f $cert && -f $key;
 eval { require IO::Socket::SSL; 1 } or plan skip_all => 'IO::Socket::SSL not installed';
 plan skip_all => 'OpenSSL too old for TLS 1.3 client' unless tls_client_ok();
 
-plan tests => 4;
-
 my $RD     = 2 * TIMEOUT_MULT;   # read_timeout
 my $CHUNKS = 8;
 my $GAP    = 0.35 * TIMEOUT_MULT; # whole response needs ~2.8x read_timeout
+
+# The TLS client says nothing after its request, so the handshake burns the
+# same idle clock the reply must outlive.  A box that spends a quarter of
+# read_timeout just getting through one handshake is reaped before any chunk.
+require_tls_handshake_under($RD / 4, 'the read_timeout this test sets');
+
+plan tests => 4;
 
 # Same app every time; only the transport changes.
 sub spawn {

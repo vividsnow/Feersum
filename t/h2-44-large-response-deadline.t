@@ -8,63 +8,12 @@ use lib 't'; use Utils; use H2Utils;
 use Feersum;
 use Socket qw(SOL_SOCKET SO_SNDBUF SO_RCVBUF);
 use Time::HiRes qw(time);
-use IO::Socket::INET ();
-use POSIX ();
 
 use constant TMULT => $ENV{PERL_TEST_TIME_OUT_FACTOR} || ($ENV{AUTOMATED_TESTING} ? 2 : 1);
 use constant TPUT_HEADROOM => 5;   # sustained TLS throughput must clear this x the paced read rate
-
-# Loopback TLS bulk-throughput probe. A box that cannot clear the paced read
-# rate with headroom (a no-AES armv6l smoker under parallel load) has its slow
-# reader reaped mid-stream before the transport-progress deadline is exercised,
-# so the whole file skips rather than false-fails. Returns MB/s, 0 on a transfer
-# that could not finish in time, or undef on a setup error (caller runs anyway).
-sub tls_mb_per_s {
-    return undef unless -r 't/certs/alpha.crt' && -r 't/certs/alpha.key';
-    my ($lsock, $lport) = get_listen_socket() or return undef;
-    my $bytes = 8 * 1024 * 1024;
-    my $pid = fork;
-    return undef unless defined $pid;
-    if (!$pid) {
-        $SIG{QUIT} = 'DEFAULT';
-        $lsock->blocking(1);
-        my $c = $lsock->accept;
-        if ($c && IO::Socket::SSL->start_SSL($c, SSL_server => 1,
-                SSL_cert_file => 't/certs/alpha.crt', SSL_key_file => 't/certs/alpha.key')) {
-            my $chunk = 'D' x 65536;
-            my $left = $bytes;
-            while ($left > 0) {
-                my $n = syswrite($c, $chunk, $left < 65536 ? $left : 65536);
-                last unless $n;
-                $left -= $n;
-            }
-        }
-        close $c if $c;
-        POSIX::_exit(0);
-    }
-    close $lsock;
-    my ($mbps, $timed_out);
-    eval {
-        local $SIG{ALRM} = sub { $timed_out = 1; die "probe timeout\n" };
-        alarm 20 * TMULT;
-        my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $lport,
-            Proto => 'tcp', Timeout => 5 * TMULT) or die "connect: $!\n";
-        IO::Socket::SSL->start_SSL($c, SSL_verify_mode => 0) or die "ssl handshake failed\n";
-        my ($got, $start) = (0, time);
-        while ($got < $bytes) {
-            my $n = sysread($c, my $part, 65536);
-            last unless $n;
-            $got += $n;
-        }
-        my $el = time - $start;
-        close $c;
-        $mbps = $el > 0 ? ($got / 1048576) / $el : undef;
-        alarm 0;
-    };
-    reap_server($pid, 5);
-    return 0 if $timed_out;   # could not move 8 MiB in 20*TMULT: too slow
-    return $mbps;
-}
+# Floor the deadline: at TMULT 1 a bare 0.2s leaves no room for scheduling
+# jitter, and a loaded-but-fast smoker then reaps its own paced reader.
+use constant WT_FLOOR => 0.5;
 
 my $probe = Feersum->new_instance;
 plan skip_all => 'TLS/H2 unavailable' unless $probe->has_tls && $probe->has_h2
@@ -72,14 +21,11 @@ plan skip_all => 'TLS/H2 unavailable' unless $probe->has_tls && $probe->has_h2
 my $size = 18 * 1024 * 1024; # exceed the 16 MiB ciphertext cap
 my $window = 32 * 1024 * 1024;
 my $wt = ($probe->has_outq_probe ? 0.2 : 1) * TMULT;
+$wt = WT_FLOOR if $wt < WT_FLOOR;
 # reader rate: the reply spans several write deadlines whatever the sleep granularity
 my $pace = $size / (8 * $wt);
 
-my $need_mb_s = TPUT_HEADROOM * $pace / 1048576;
-my $tput = tls_mb_per_s();
-plan skip_all => sprintf('TLS throughput %.1f MB/s lacks headroom over paced %.1f MB/s',
-    $tput, $pace / 1048576) if defined($tput) && $tput < $need_mb_s;
-diag sprintf 'TLS loopback throughput ~%.0f MB/s (need ~%.0f)', $tput, $need_mb_s if defined $tput;
+require_tls_throughput(TPUT_HEADROOM * $pace / 1048576, 'this paced bulk reader');
 
 {
     package LargeProgressBody;

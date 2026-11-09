@@ -160,6 +160,7 @@ t/h1-41-host-authority-strict.t
 t/h1-42-chunked-strict.t
 t/h1-43-status-code-precision.t
 t/h1-44-eof-park-timing.t
+t/h1-45-ignored-body-not-kept.t
 t/h2-01-basic.t
 t/h2-02-error-handling.t
 t/h2-03-edge-cases.t
@@ -207,6 +208,9 @@ t/h2-45-shutdown-drain-semantics.t
 t/h2-46-limit-data-reset.t
 t/h2-47-limit-data-reset-aggregate.t
 t/h2-48-eof-park-bound.t
+t/h2-49-batched-tls-records.t
+t/h2-50-nested-loop-flush.t
+t/h2-51-dropped-writer-stack.t
 t/limits-01-slow-client.t
 t/limits-02-slowloris-protection.t
 t/limits-03-security-edge-cases.t
@@ -247,6 +251,11 @@ t/native-06-response-validation.t
 t/native-07-return-from-io-wrong-handle.t
 t/native-08-return-from-io-fd-ownership.t
 t/native-09-double-takeover-no-408.t
+t/native-10-deferred-write-unlisten.t
+t/native-11-relisten-after-keepalive-request.t
+t/native-12-deferred-write-linger.t
+t/native-13-chunk-size-lines.t
+t/native-14-handle-drop-buffer-reuse.t
 t/plack-01-basic.t
 t/plack-02-suite.t
 t/plack-03-runner.t
@@ -362,6 +371,11 @@ t/tls-37-handshake-dribble-renews.t
 t/tls-38-sni-trailing-dot.t
 t/tls-39-eof-park-closed-writer.t
 t/tls-40-decline-drain-bound.t
+t/tls-41-destroy-reentry-order.t
+t/tls-42-idle-wbuf-trim.t
+t/tls-43-croak-mid-slot.t
+t/tls-44-record-boundaries.t
+t/tls-45-encrypt-ahead-bound.t
 t/H2Utils.pm
 t/Utils.pm
 t/certs/alpha.crt

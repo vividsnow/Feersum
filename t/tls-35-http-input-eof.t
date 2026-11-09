@@ -71,9 +71,12 @@ if (!$pid) {
         close $io;
     });
     my $stats = EV::timer(0.02, 0.02, sub {
-        open my $out, '>', "$dir/active" or die $!;
+        # atomic: rewriting in place leaves the file truncated for a window a
+        # slow reader lands in, and an exit mid-truncate leaves it empty for good
+        open my $out, '>', "$dir/active.tmp" or die $!;
         print {$out} $f->active_conns + $stalled->active_conns;
         close $out;
+        rename "$dir/active.tmp", "$dir/active" or die $!;
     });
     my $life = EV::timer(40 * TMULT, 0, sub { POSIX::_exit(0) });
     EV::run;
@@ -131,8 +134,8 @@ sub coalescing_proxy {
 }
 
 sub active_count {
-    my $active = -1;
-    my $deadline = time + TMULT;
+    my $active = -1;   # the server never published a count at all
+    my $deadline = time + 10 * TMULT;   # releasing after a TLS teardown is slow on a slow box
     while (time < $deadline) {
         if (open my $in, '<', "$dir/active") { $active = <$in> // -1; close $in }
         last if $active == 0;

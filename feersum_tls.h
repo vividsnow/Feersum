@@ -10,7 +10,15 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
-#define TLS_RAW_BUFSZ 16384
+#define TLS_RAW_BUFSZ 32768
+#define TLS_GATHER_BUFSZ 4096
+/* ciphertext queued ahead of the socket before encryption pauses */
+#define FEER_TLS_ENCRYPT_AHEAD (1024 * 1024)
+#define TLS_DEC_SCRATCH (16384 + 512)
+
+/* an idle conn's ciphertext buffer above this is freed after FEER_TLS_WBUF_TRIM_S idle */
+#define FEER_TLS_WBUF_KEEP (64 * 1024)
+#define FEER_TLS_WBUF_TRIM_S 1.0
 
 /* handshake reassembly cap; picotls's default of 0 is unlimited */
 #define FEER_TLS_MAX_HANDSHAKE_BUF 65536

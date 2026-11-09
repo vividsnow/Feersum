@@ -127,6 +127,29 @@ h2_session_send_and_poll(pTHX_ struct feer_conn *parent)
 }
 
 static void
+h2_queue_flush(struct feer_conn *parent)
+{
+    if (parent->h2_flush_queued) return;
+    parent->h2_flush_queued = 1;
+    SvREFCNT_inc_void_NN(parent->self);
+    rinq_push(&parent->server->h2_flush_rinq, parent);
+}
+
+static void
+h2_drain_flush_rinq(struct feer_server *server)
+{
+    dTHX;
+    while (server->h2_flush_rinq) {
+        struct feer_conn *p = (struct feer_conn *)rinq_shift(&server->h2_flush_rinq);
+        if (unlikely(!p)) break;
+        p->h2_flush_queued = 0;
+        if (likely(p->fd >= 0 && p->h2_session))
+            h2_session_send_and_poll(aTHX_ p);
+        SvREFCNT_dec(p->self);
+    }
+}
+
+static void
 h2_stream_write_timeout(EV_P_ ev_timer *w, int revents)
 {
     dTHX;
@@ -340,9 +363,51 @@ h2_send_cb(nghttp2_session *session, const uint8_t *data,
         return NGHTTP2_ERR_CALLBACK_FAILURE;
     if (unlikely(c->tls_wbuf.off >= FEER_H2_MAX_WBUF))
         return NGHTTP2_ERR_WOULDBLOCK;
+    if (c->h2_stage && length >= H2_STAGE_SZ / 2) {
+        if (c->h2_stage_len) {
+            size_t sl = c->h2_stage_len;
+            c->h2_stage_len = 0;
+            if (feer_tls_send(c, c->h2_stage, sl) != 0)
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+    }
+    else if (c->h2_stage) {
+        const uint8_t *p = data;
+        size_t left = length;
+        if (c->h2_stage_len + left < H2_STAGE_SZ) {
+            memcpy(c->h2_stage + c->h2_stage_len, p, left);
+            c->h2_stage_len += left;
+            return (ssize_t)length;
+        }
+        if (c->h2_stage_len > 0) {
+            size_t room = H2_STAGE_SZ - c->h2_stage_len;
+            memcpy(c->h2_stage + c->h2_stage_len, p, room);
+            p += room; left -= room;
+            c->h2_stage_len = 0;
+            if (feer_tls_send(c, c->h2_stage, H2_STAGE_SZ) != 0)
+                return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+        size_t whole = left - left % H2_STAGE_SZ;
+        if (whole && feer_tls_send(c, p, whole) != 0)
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        memcpy(c->h2_stage, p + whole, left - whole);
+        c->h2_stage_len = left - whole;
+        return (ssize_t)length;
+    }
     if (feer_tls_send(c, data, length) != 0)
         return NGHTTP2_ERR_CALLBACK_FAILURE;
     return (ssize_t)length;
+}
+
+/* a full-size DATA frame plus its 9-byte header fills exactly one TLS record */
+static ssize_t
+h2_read_length_cb(nghttp2_session *session, uint8_t frame_type, int32_t stream_id,
+                  int32_t session_window, int32_t stream_window,
+                  uint32_t remote_max_frame_size, void *user_data)
+{
+    PERL_UNUSED_VAR(session); PERL_UNUSED_VAR(frame_type); PERL_UNUSED_VAR(stream_id);
+    PERL_UNUSED_VAR(session_window); PERL_UNUSED_VAR(stream_window); PERL_UNUSED_VAR(user_data);
+    return remote_max_frame_size < 16384 - 9 ? (ssize_t)remote_max_frame_size : 16384 - 9;
 }
 
 static int
@@ -903,6 +968,7 @@ feer_h2_init_session(struct feer_conn *c)
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, h2_on_data_chunk_recv_cb);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, h2_on_stream_close_cb);
     nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(callbacks, h2_on_invalid_frame_recv_cb);
+    nghttp2_session_callbacks_set_data_source_read_length_callback(callbacks, h2_read_length_cb);
 
     rv = nghttp2_session_server_new(&c->h2_session, callbacks, c);
     nghttp2_session_callbacks_del(callbacks);
@@ -1056,7 +1122,19 @@ feer_h2_session_send(struct feer_conn *c)
             c->fd, nghttp2_session_want_write(c->h2_session),
             nghttp2_session_want_read(c->h2_session));
 
+    uint8_t stage[H2_STAGE_SZ];
+    uint8_t *outer_stage = c->h2_stage;
+    if (outer_stage && c->h2_stage_len) {
+        feer_tls_send(c, outer_stage, c->h2_stage_len);
+        c->h2_stage_len = 0;
+    }
+    c->h2_stage = stage;
+    c->h2_stage_len = 0;
     int rv = nghttp2_session_send(c->h2_session);
+    if (c->h2_stage_len && c->fd >= 0)
+        feer_tls_send(c, stage, c->h2_stage_len);
+    c->h2_stage = outer_stage;
+    c->h2_stage_len = 0;
     if (rv != 0) {
         trouble("nghttp2_session_send error fd=%d: %s\n",
                 c->fd, nghttp2_strerror(rv));
@@ -1541,7 +1619,10 @@ feersum_h2_write_whole_body(pTHX_ struct feer_conn *c, SV *body_sv)
     {
         int32_t sid = stream->stream_id;
         PERL_UNUSED_VAR(sid); /* only consumed by h2_diag() */
-        h2_session_send_and_poll(aTHX_ parent);
+        if (c->server->h2_dispatch_depth)
+            h2_queue_flush(parent);
+        else
+            h2_session_send_and_poll(aTHX_ parent);
         h2_diag("DONE stream=%d\n", sid);
     }
     change_responding_state(c, RESPOND_SHUTDOWN);

@@ -105,9 +105,11 @@ if ($pid == 0) {
     select(undef, undef, undef, 0.5);
     my $cli = h2_connect() or POSIX::_exit(10);
     h2_get_request($cli) or POSIX::_exit(11);
-    open my $fh, '>', "$dir/fin.mark" or POSIX::_exit(12);
+    # atomic: -f turns true at create, so a reader can catch the mark empty
+    open my $fh, '>', "$dir/fin.mark.tmp" or POSIX::_exit(12);
     print $fh time, "\n";
     close $fh;
+    rename "$dir/fin.mark.tmp", "$dir/fin.mark" or POSIX::_exit(12);
     CORE::shutdown($cli, SHUT_WR) or POSIX::_exit(13);
     $cli->blocking(0);
     my ($rbuf, $saw_goaway, $saw_eof) = ('', 0, 0);
@@ -128,9 +130,10 @@ if ($pid == 0) {
         }
         sleep 0.05;
     }
-    open my $lf, '>', "$dir/client.log" or POSIX::_exit(14);
+    open my $lf, '>', "$dir/client.log.tmp" or POSIX::_exit(14);
     print $lf "goaway=$saw_goaway eof=$saw_eof\n";
     close $lf;
+    rename "$dir/client.log.tmp", "$dir/client.log" or POSIX::_exit(14);
     POSIX::_exit(0);
 }
 
@@ -183,9 +186,10 @@ if ($pid == 0) {
     select(undef, undef, undef, 0.5);
     my $cli = h2_connect() or POSIX::_exit(10);
     h2_get_request($cli) or POSIX::_exit(11);
-    open my $fh, '>', "$dir/fin2.mark" or POSIX::_exit(12);
+    open my $fh, '>', "$dir/fin2.mark.tmp" or POSIX::_exit(12);
     print $fh time, "\n";
     close $fh;
+    rename "$dir/fin2.mark.tmp", "$dir/fin2.mark" or POSIX::_exit(12);
     CORE::shutdown($cli, SHUT_WR) or POSIX::_exit(13);
     sleep 5;   # outlast the fixed 2s park; parent kills on reap
     POSIX::_exit(0);

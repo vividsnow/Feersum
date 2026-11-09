@@ -354,6 +354,7 @@ struct feer_conn {
     bool is_keepalive;
     int reqs;
     SV *rbuf;
+    SV *rbuf_spare;
     struct rinq *wbuf_rinq;
     size_t wbuf_len;
     struct feer_req *req;
@@ -419,6 +420,7 @@ struct feer_conn {
      * every site that arms the deadline or stops the timer must clear it. */
     unsigned int poll_retry_pending:1;
     unsigned int poll_retry_backoff:4;
+    unsigned int write_flush_queued:1;
     /* Consecutive write-deadline checks with no send-queue drain; one is not
      * proof the peer stopped, ACKs arrive in clumps. */
     unsigned int outq_stalls:2;
@@ -475,10 +477,14 @@ struct feer_conn {
     ptls_t         *tls;
     struct feer_tls_ctx_ref *tls_ctx_ref;
     ptls_buffer_t   tls_wbuf;
+    /* written prefix of tls_wbuf; size caps count it, or the buffer doubles */
+    size_t          tls_wbuf_sent;
     uint8_t        *tls_rbuf;
+    uint8_t        *tls_rbuf_base; /* owns tls_rbuf; NULL while it borrows the read buffer */
     size_t          tls_rbuf_len;
     unsigned int    tls_handshake_done:1;
     unsigned int    tls_input_eof:1; /* peer FIN or close_notify */
+    unsigned int    tls_wbuf_quiet:1;
     /* Alert owed for an undecryptable record; sent fatal in place of close_notify */
     uint8_t         tls_fatal_alert;
 
@@ -505,9 +511,12 @@ struct feer_conn {
     /* Last stream closed during shutdown/input EOF, or nghttp2 terminated;
      * close once tls_wbuf is flushed, not in the nghttp2 callback. */
     unsigned int           h2_close_pending:1;
+    unsigned int           h2_flush_queued:1;
     /* Wire boundaries for the header deadline, including rejected blocks for
      * which nghttp2 does not issue a frame-completion callback. */
     uint8_t                h2_rx_header[9];
+    uint8_t               *h2_stage;
+    size_t                 h2_stage_len;
     uint8_t                h2_rx_header_used;
     uint8_t                h2_rx_preface_left;
     uint32_t               h2_rx_payload_left;
@@ -608,9 +617,17 @@ struct feer_server {
     ev_prepare       ep;
     ev_check         ec;
     struct ev_idle   ei;
+#ifdef FEERSUM_HAS_TLS
+    ev_timer         tls_wbuf_trim_w;
+#endif
     struct rinq     *request_ready_rinq;
     struct rinq     *idle_keepalive_rinq;
     struct rinq     *response_cleanup_rinq;
+    struct rinq     *write_ready_rinq;
+#ifdef FEERSUM_HAS_H2
+    struct rinq     *h2_flush_rinq;
+    unsigned int     h2_dispatch_depth;
+#endif
 };
 
 typedef struct feer_conn feer_conn_handle;
@@ -628,6 +645,8 @@ extern char DATE_BUF[];
 extern HV *feer_stash, *feer_conn_stash;
 extern HV *feer_conn_reader_stash, *feer_conn_writer_stash;
 extern MGVTBL psgix_io_vtbl;
+extern MGVTBL feer_handle_vtbl;
+static int feer_handle_svt_free(pTHX_ SV *sv, MAGIC *mg);
 extern struct feer_server *default_server;
 extern struct ev_loop *feersum_ev_loop;
 extern AV *psgi_ver;
@@ -749,6 +768,8 @@ static void finish_receiving(struct feer_conn *c);
 #ifdef FEERSUM_HAS_TLS
 static void feer_tls_init_conn(struct feer_conn *c, struct feer_tls_ctx_ref *ref);
 static void feer_tls_free_conn(struct feer_conn *c);
+static void feer_tls_note_idle(struct feer_conn *c);
+static void tls_wbuf_trim_cb(EV_P_ ev_timer *w, int revents);
 static int feer_tls_flush_wbuf(struct feer_conn *c);
 static int feer_tls_send(struct feer_conn *c, const void *data, size_t len);
 static void feer_tls_setup_tunnel(struct feer_conn *c);
@@ -760,7 +781,7 @@ static struct feer_tls_ctx_ref *feer_tls_ctx_ref_new(ptls_context_t *ctx);
 static void feer_tls_ctx_ref_dec(struct feer_tls_ctx_ref *ref);
 static void feer_tls_cleanup_listener(struct feer_listen *lsnr);
 #ifdef FEERSUM_HAS_H2
-static void drain_h2_tls_records(struct feer_conn *c);
+static void drain_h2_tls_records(struct feer_conn *c, uint8_t *scratch);
 #endif
 static void tls_tunnel_sv0_read_cb(EV_P_ struct ev_io *w, int revents);
 static void tls_tunnel_sv0_write_cb(EV_P_ struct ev_io *w, int revents);
@@ -769,6 +790,13 @@ static void feer_tls_tunnel_shutdown(struct feer_conn *c);
 #endif
 
 static void conn_write_ready (struct feer_conn *c);
+static void conn_write_now (struct feer_conn *c);
+static void feersum_drain_write_ready (struct feer_server *server);
+static void feersum_write_ready_to_watchers (struct feer_server *server);
+#ifdef FEERSUM_HAS_H2
+static void h2_queue_flush (struct feer_conn *parent);
+static void h2_drain_flush_rinq (struct feer_server *server);
+#endif
 static void respond_with_server_error(struct feer_conn *c, const char *msg, int code);
 static void send_100_continue(struct feer_conn *c);
 static void free_feer_req(struct feer_req *req);
@@ -855,6 +883,7 @@ static SV* fetch_av_normal (pTHX_ AV *av, I32 i);
     } \
 } while(0)
 
+/* not zeroed on reuse: every producer fills or clears its slot before it can croak */
 #define IOMATRIX_ALLOC(m_) do { \
     extern struct iomatrix *iomatrix_freelist; \
     extern int iomatrix_freelist_count; \
@@ -862,10 +891,6 @@ static SV* fetch_av_normal (pTHX_ AV *av, I32 i);
         m_ = iomatrix_freelist; \
         iomatrix_freelist = *(struct iomatrix **)iomatrix_freelist; \
         iomatrix_freelist_count--; \
-        Zero(m_->sv, FEERSUM_IOMATRIX_SIZE, SV*); \
-        /* iov too: a croak between a slot's count++ and its fill would \
-         * otherwise writev() the previous connection's stale pointer. */ \
-        Zero(m_->iov, FEERSUM_IOMATRIX_SIZE, struct iovec); \
     } else { \
         Newxz(m_, 1, struct iomatrix); \
     } \

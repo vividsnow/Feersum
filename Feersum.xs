@@ -156,8 +156,16 @@ accept_on_fd(struct feer_server *server, int fd)
         ev_set_priority(&server->ec, EV_MINPRI);
         ev_check_start(feersum_ev_loop, &server->ec);
 
-        ev_idle_init(&server->ei, idle_cb);
-        server->ei.data = (void *)server;
+        /* a conn that outlived unlisten() can have restarted it */
+        if (!ev_is_active(&server->ei)) {
+            ev_idle_init(&server->ei, idle_cb);
+            server->ei.data = (void *)server;
+        }
+#ifdef FEERSUM_HAS_TLS
+        ev_timer_init(&server->tls_wbuf_trim_w, tls_wbuf_trim_cb,
+                      FEER_TLS_WBUF_TRIM_S, FEER_TLS_WBUF_TRIM_S);
+        server->tls_wbuf_trim_w.data = (void *)server;
+#endif
 
         date_timer_refs++;
     } else if (!ev_is_active(&server->ep)) {
@@ -188,7 +196,11 @@ unlisten (struct feer_server *server)
     trace("stopping accept\n");
     ev_prepare_stop(feersum_ev_loop, &server->ep);
     ev_check_stop(feersum_ev_loop, &server->ec);
+#ifdef FEERSUM_HAS_TLS
+    ev_timer_stop(feersum_ev_loop, &server->tls_wbuf_trim_w);
+#endif
     ev_idle_stop(feersum_ev_loop, &server->ei);
+    feersum_write_ready_to_watchers(server);
     for (int i = 0; i < server->n_listeners; i++) {
         struct feer_listen *lsnr = &server->listeners[i];
         ev_io_stop(feersum_ev_loop, &lsnr->accept_w);
@@ -780,6 +792,9 @@ _xs_destroy (struct feer_server *server)
     ev_prepare_stop(feersum_ev_loop, &server->ep);
     ev_check_stop(feersum_ev_loop, &server->ec);
     ev_idle_stop(feersum_ev_loop, &server->ei);
+#ifdef FEERSUM_HAS_TLS
+    ev_timer_stop(feersum_ev_loop, &server->tls_wbuf_trim_w);
+#endif
     SvREFCNT_dec(server->request_cb_cv);
     SvREFCNT_dec(server->shutdown_cb_cv);
     SvREFCNT_dec(server->max_requests_cb_cv);
@@ -1029,6 +1044,8 @@ BOOT:
 
         Zero(&psgix_io_vtbl, 1, MGVTBL);
         psgix_io_vtbl.svt_get = psgix_io_svt_get;
+        Zero(&feer_handle_vtbl, 1, MGVTBL);
+        feer_handle_vtbl.svt_free = feer_handle_svt_free;
         newCONSTSUB(feer_stash, "HEADER_NORM_SKIP", newSViv(HEADER_NORM_SKIP));
         newCONSTSUB(feer_stash, "HEADER_NORM_UPCASE", newSViv(HEADER_NORM_UPCASE));
         newCONSTSUB(feer_stash, "HEADER_NORM_LOCASE", newSViv(HEADER_NORM_LOCASE));
