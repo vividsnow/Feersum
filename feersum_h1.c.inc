@@ -999,7 +999,12 @@ process_request_headers (struct feer_conn *c, int body_offset)
     from += body_offset;
     STRLEN need = from_len - body_offset;
     trace("new rbuf for body %d need=%"Sz_uf"\n", c->fd, (Sz)need);
-    SV *new_rbuf = newSVpvn(need > 0 ? from : "", need);
+    SV *new_rbuf = c->rbuf_spare;
+    if (new_rbuf) {
+        c->rbuf_spare = NULL;
+        sv_setpvn(new_rbuf, need > 0 ? from : "", need);
+    } else
+        new_rbuf = newSVpvn(need > 0 ? from : "", need);
 
     req->buf = c->rbuf;
     c->rbuf = new_rbuf;
@@ -1246,7 +1251,7 @@ got_it_all:
 }
 
 static void
-conn_write_ready (struct feer_conn *c)
+conn_write_now (struct feer_conn *c)
 {
 #ifdef FEERSUM_HAS_H2
     if (c->is_h2_stream) {
@@ -1254,11 +1259,6 @@ conn_write_ready (struct feer_conn *c)
         return;
     }
 #endif
-
-    if (c->in_callback) {
-        start_write_watcher(c);
-        return;
-    }
 
 #ifdef FEERSUM_HAS_TLS
     if (c->tls) {
@@ -1268,6 +1268,67 @@ conn_write_ready (struct feer_conn *c)
 #endif
 
     try_conn_write(feersum_ev_loop, &c->write_ev_io, EV_WRITE);
+}
+
+/* outside a Feersum callback, a loop turn's writes share one check_cb flush */
+static void
+conn_write_ready (struct feer_conn *c)
+{
+#ifdef FEERSUM_HAS_H2
+    if (c->is_h2_stream) {
+        h2_try_stream_write(aTHX_ c);
+        return;
+    }
+#endif
+
+    if (c->in_callback || unlikely(!ev_is_active(&c->server->ec))) {
+        start_write_watcher(c);
+        return;
+    }
+
+    if (c->write_flush_queued) return;
+    c->write_flush_queued = 1;
+    rinq_push(&c->server->write_ready_rinq, c);
+    SvREFCNT_inc_void_NN(c->self);
+    if (!ev_is_active(&c->server->ei))
+        ev_idle_start(feersum_ev_loop, &c->server->ei);
+}
+
+/* idle keepalive and lingering conns are done: a stale flush must not redo */
+static int
+conn_has_write_work (struct feer_conn *c)
+{
+    return c->fd >= 0 && !c->closing_linger
+        && !(c->responding == RESPOND_NOT_STARTED && !c->wbuf_rinq
+             && c->sendfile_fd < 0);
+}
+
+static void
+feersum_drain_write_ready (struct feer_server *server)
+{
+    while (server->write_ready_rinq) {
+        struct feer_conn *c =
+            (struct feer_conn *)rinq_shift(&server->write_ready_rinq);
+        if (unlikely(!c)) break;
+        c->write_flush_queued = 0;
+        if (likely(conn_has_write_work(c)))
+            conn_write_now(c);
+        SvREFCNT_dec(c->self);
+    }
+}
+
+static void
+feersum_write_ready_to_watchers (struct feer_server *server)
+{
+    while (server->write_ready_rinq) {
+        struct feer_conn *c =
+            (struct feer_conn *)rinq_shift(&server->write_ready_rinq);
+        if (unlikely(!c)) break;
+        c->write_flush_queued = 0;
+        if (conn_has_write_work(c))
+            start_write_watcher(c);
+        SvREFCNT_dec(c->self);
+    }
 }
 
 /* H2 dispatch shims for XS CODE/PPCODE blocks (which cannot use #ifdef). */

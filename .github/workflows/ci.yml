@@ -444,7 +444,10 @@ jobs:
   # action and the runner's x86_64 node cannot exec inside a linux/386 image.
   linux-i386:
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-26.04 a native i386 container cannot resolve DNS (the
+    # same commit passed on 24.04 and failed on 26.04), while the QEMU-run
+    # arm32 job below is unaffected.  Check that before moving this forward.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
     steps:
@@ -458,7 +461,11 @@ jobs:
             i386/debian:stable sh -s <<'EOS'
           set -e
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq
+          # An update that reached no mirror still exits 0, and every install
+          # then fails with "Unable to locate package", which reads as packages
+          # having been removed rather than as the DNS failure it actually was.
+          # Error-Mode=any makes that fetch warning the failure it is.
+          apt-get update -qq -o APT::Update::Error-Mode=any
           apt-get install -y -qq perl gcc make libssl-dev libnghttp2-dev cpanminus \
             libev-perl libanyevent-perl libguard-perl libtest-fatal-perl \
             libio-socket-ssl-perl libtest-tcp-perl libjson-xs-perl \
@@ -577,10 +584,17 @@ jobs:
             PERL_TEST_TIME_OUT_FACTOR=2 make test
 
   netbsd:
-    timeout-minutes: 45
+    timeout-minutes: 75
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      matrix:
+        include:
+          - h2: yes
+            factor: 2
+          - h2: no
+            factor: 1
+    name: netbsd (h2 ${{ matrix.h2 }}, factor ${{ matrix.factor }})
     steps:
       - uses: actions/checkout@v4
         with:
@@ -591,18 +605,43 @@ jobs:
         with:
           usesh: true
           prepare: |
-            /usr/sbin/pkg_add p5-EV p5-AnyEvent p5-Plack p5-Guard p5-Test-Fatal p5-Test-LeakTrace p5-Test-SharedFork p5-JSON-XS p5-HTTP-Entity-Parser p5-Test-TCP p5-HTML-Parser p5-IO-Socket-SSL p5-App-cpanminus p5-PkgConfig p5-Capture-Tiny p5-FFI-CheckLib p5-File-chdir nghttp2
+            for p in p5-EV p5-AnyEvent p5-Plack p5-Guard p5-Test-Fatal p5-Test-LeakTrace p5-Test-SharedFork p5-JSON-XS p5-HTTP-Entity-Parser p5-Test-TCP p5-HTML-Parser p5-IO-Socket-SSL p5-App-cpanminus p5-PkgConfig p5-Capture-Tiny p5-FFI-CheckLib p5-File-chdir nghttp2; do /usr/sbin/pkg_add $p || echo "MISSING $p"; done
           run: |
             perl -V
-            cpanm -n Alien::nghttp2
+            command -v cpanm >/dev/null || perl -MHTTP::Tiny -e 'print HTTP::Tiny->new->get("https://cpanmin.us")->{content}' | perl - -n App::cpanminus
+            PATH="$PATH:$(perl -MConfig -e 'print $Config{installsitescript}')"; export PATH
+            for m in EV AnyEvent Guard JSON::XS Test::Fatal Test::LeakTrace Test::TCP Test::SharedFork Plack HTTP::Entity::Parser Capture::Tiny IO::Socket::SSL; do perl -M$m -e 1 2>/dev/null || cpanm -n $m; done
+            if [ "${{ matrix.h2 }}" = yes ]; then cpanm -n Alien::nghttp2; fi
             perl Makefile.PL
             make
             perl -Mblib -MFeersum -e 'my $f = Feersum->new;
               die "TLS not compiled in\n" unless $f->has_tls;
-              die "H2 not compiled in\n"  unless $f->has_h2;
-              print "TLS and H2 present\n"'
+              die "H2 build does not match the matrix\n" unless !$f->has_h2 == ($ARGV[0] ne "yes");
+              print "TLS present, H2 $ARGV[0]\n"' ${{ matrix.h2 }}
             # This platform's nghttp2 package ships the library without the client
             # tools; the H2 tests skip themselves when nghttp is absent, so say so
             # loudly rather than failing the whole platform.
             command -v nghttp >/dev/null || echo "WARNING: nghttp client absent - H2 tests will skip"
-            PERL_TEST_TIME_OUT_FACTOR=2 make test
+            PERL_TEST_TIME_OUT_FACTOR=${{ matrix.factor }} make test
+
+  hurd:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Test on GNU/Hurd
+        uses: vmactions/hurd-vm@v1
+        with:
+          prepare: |
+            apt-get update
+            for p in build-essential pkg-config libssl-dev cpanminus libev-perl libanyevent-perl libguard-perl libjson-xs-perl libtest-fatal-perl libtest-tcp-perl libtest-sharedfork-perl libtest-leaktrace-perl libio-socket-ssl-perl libnet-ssleay-perl libplack-perl libhttp-entity-parser-perl libcapture-tiny-perl; do apt-get install -y "$p" || echo "MISSING $p"; done
+          run: |
+            perl -V
+            cpanm -n --installdeps .
+            perl Makefile.PL
+            make
+            useradd -m smoke || true
+            su smoke -c "cd '$PWD' && PERL_TEST_TIME_OUT_FACTOR=2 prove -b $(ls t/*.t | grep -vE 'runner-14-|limits-08-' | tr '\n' ' ')"

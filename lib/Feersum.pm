@@ -6,7 +6,7 @@ use EV ();
 use Carp ();
 use Socket ();
 
-our $VERSION = '1.509';
+our $VERSION = '1.510_06';
 
 require Feersum::Connection;
 require Feersum::Connection::Handle;

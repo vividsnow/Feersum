@@ -65,6 +65,7 @@ add_sv_to_wbuf(struct feer_conn *c, SV *sv)
     // newSVsv() below can croak on a magical SV, leaving the slot counted but unfilled
     m->iov[idx].iov_base = NULL;
     m->iov[idx].iov_len = 0;
+    m->sv[idx] = NULL;
     if (unlikely(SvMAGICAL(sv) || SvUTF8(sv))) {
         sv = newSVsv(sv);
         if (unlikely(SvUTF8(sv)))
@@ -165,6 +166,7 @@ add_placeholder_to_wbuf(struct feer_conn *c, SV **sv, struct iovec **iov_ref)
     // must leave an empty iovec, not stale memory.
     m->iov[idx].iov_base = NULL;
     m->iov[idx].iov_len = 0;
+    m->sv[idx] = NULL;
     *sv = newSV(31);
     SvPOK_on(*sv);
     m->sv[idx] = *sv;
@@ -208,7 +210,16 @@ add_chunk_sv_to_wbuf(struct feer_conn *c, SV *sv)
     add_placeholder_to_wbuf(c, &chunk, &chunk_iov);
     STRLEN cur = add_sv_to_wbuf(c, sv);
     add_crlf_to_wbuf(c);
-    sv_setpvf(chunk, "%"Sz_xf CRLF, (Sz)cur);
+    {
+        char tmp[2 * sizeof(Sz)];
+        unsigned n = 0;
+        Sz v = (Sz)cur;
+        do { tmp[n++] = "0123456789abcdef"[v & 0xf]; v >>= 4; } while (v);
+        char *p = SvPVX(chunk);
+        for (unsigned i = 0; i < n; i++) p[i] = tmp[n - 1 - i];
+        p[n] = '\r'; p[n + 1] = '\n'; p[n + 2] = '\0';
+        SvCUR_set(chunk, n + 2);
+    }
     update_wbuf_placeholder(c, chunk, chunk_iov);
 }
 
@@ -338,6 +349,9 @@ invoke_shutdown_cb(pTHX_ struct feer_server *server)
     ev_idle_stop(feersum_ev_loop, &server->ei);
     ev_prepare_stop(feersum_ev_loop, &server->ep);
     ev_check_stop(feersum_ev_loop, &server->ec);
+#ifdef FEERSUM_HAS_TLS
+    ev_timer_stop(feersum_ev_loop, &server->tls_wbuf_trim_w);
+#endif
     if (server->watchers_initialized) {
         server->watchers_initialized = false;
         if (--date_timer_refs <= 0) {
@@ -546,6 +560,11 @@ INLINE_UNLESS_DEBUG
 static struct feer_conn *
 sv_2feer_conn (SV *rv)
 {
+    if (likely(SvROK(rv) && !SvGMAGICAL(rv))) {
+        SV *sv = SvRV(rv);
+        if (likely(SvOBJECT(sv) && SvSTASH(sv) == feer_conn_stash))
+            return (struct feer_conn *)SvPVX(sv);
+    }
     if (unlikely(!sv_isa(rv,"Feersum::Connection")))
        croak("object is not of type Feersum::Connection");
     return (struct feer_conn *)SvPVX(SvRV(rv));
@@ -570,7 +589,7 @@ sv_2feer_conn_handle (SV *rv, bool can_croak)
         (SvSTASH(sv) == feer_conn_writer_stash ||
          SvSTASH(sv) == feer_conn_reader_stash)
     )) {
-        UV uv = SvUV(sv);
+        UV uv = SvIOK(sv) ? SvUVX(sv) : SvUV(sv);
         if (uv == 0) {
             if (can_croak) croak("Operation not allowed: Handle is closed.");
             return NULL;
@@ -583,12 +602,34 @@ sv_2feer_conn_handle (SV *rv, bool can_croak)
     return NULL;
 }
 
+/* DESTROY as free magic, without the method dispatch */
+static int
+feer_handle_svt_free (pTHX_ SV *sv, MAGIC *mg)
+{
+    struct feer_conn *c = INT2PTR(struct feer_conn *, SvUVX(sv));
+    if (!c) return 0;
+    SvUVX(sv) = 0;
+    /* closing can run Perl (an H2 sibling's poll_cb): own stack, as curse() */
+    dSP;
+    PUSHSTACKi(PERLSI_MAGIC);
+    if (mg->mg_private)
+        feersum_close_handle(aTHX_ c, 1);
+    else
+        SvREFCNT_dec(c->self);
+    POPSTACK;
+    PERL_UNUSED_VAR(sp);
+    return 0;
+}
+
 static SV *
 new_feer_conn_handle (pTHX_ struct feer_conn *c, bool is_writer)
 {
-    SV *sv;
+    SV *sv, *obj;
     SvREFCNT_inc_void_NN(c->self);
-    sv = newRV_noinc(newSVuv(PTR2UV(c)));
+    obj = newSVuv(PTR2UV(c));
+    MAGIC *mg = sv_magicext(obj, NULL, PERL_MAGIC_ext, &feer_handle_vtbl, NULL, 0);
+    mg->mg_private = is_writer;
+    sv = newRV_noinc(obj);
     sv_bless(sv, is_writer ? feer_conn_writer_stash : feer_conn_reader_stash);
     /* Pin the referent while the guarded callback runs (see pinned_writer);
      * the !pinned_writer gate keeps a nested poll_cb's handle off the slot. */
@@ -984,6 +1025,9 @@ feer_conn_set_idle(struct feer_conn *c)
 
     c->idle_rinq_node = rinq_push(&c->server->idle_keepalive_rinq, c);
     trace("conn fd=%d is now idle (added to MRU)\n", c->fd);
+#ifdef FEERSUM_HAS_TLS
+    feer_tls_note_idle(c);
+#endif
     feer_server_resume_capacity(c->server);
 }
 
@@ -1172,6 +1216,10 @@ feer_arm_linger(struct feer_conn *c, const char *where)
 static void
 process_request_ready_rinq (struct feer_server *server)
 {
+#ifdef FEERSUM_HAS_H2
+    /* one H2 session_send per connection for the whole batch */
+    server->h2_dispatch_depth++;
+#endif
     while (server->request_ready_rinq) {
         struct feer_conn *c =
             (struct feer_conn *)rinq_shift(&server->request_ready_rinq);
@@ -1202,21 +1250,29 @@ process_request_ready_rinq (struct feer_server *server)
             continue;
         }
 
+#ifdef FEERSUM_HAS_H2
+        /* only consecutive H2 streams share a flush: H1 work must not hold it */
+        if (unlikely(server->h2_flush_rinq) && !c->is_h2_stream)
+            h2_drain_flush_rinq(server);
+#endif
         call_request_callback(c);
 
         if (likely(c->wbuf_rinq)) {
-            conn_write_ready(c);
+            conn_write_now(c);
         }
 #ifdef FEERSUM_HAS_H2
         else if (c->is_h2_stream) {
-            dTHX;
             struct feer_h2_stream *stream = H2_STREAM_FROM_PC(c);
             if (stream && stream->parent)
-                h2_session_send_and_poll(aTHX_ stream->parent);
+                h2_queue_flush(stream->parent);
         }
 #endif
         SvREFCNT_dec(c->self); // for the rinq
     }
+#ifdef FEERSUM_HAS_H2
+    server->h2_dispatch_depth--;
+    h2_drain_flush_rinq(server);
+#endif
 }
 
 static void
@@ -1255,6 +1311,15 @@ check_cb (EV_P_ ev_check *w, int revents)
     trace3("check! head=%p\n", server->request_ready_rinq);
     if (server->request_ready_rinq)
         process_request_ready_rinq(server);
+
+    if (server->write_ready_rinq)
+        feersum_drain_write_ready(server);
+
+#ifdef FEERSUM_HAS_H2
+    /* queued by a nested event loop run inside a request handler */
+    if (unlikely(server->h2_flush_rinq))
+        h2_drain_flush_rinq(server);
+#endif
 
     if (unlikely(server->response_cleanup_rinq)) {
         dTHX;
@@ -1309,11 +1374,22 @@ idle_cb (EV_P_ ev_idle *w, int revents)
     trace3("idle! head=%p\n", server->request_ready_rinq);
     if (server->request_ready_rinq)
         process_request_ready_rinq(server);
+    if (server->write_ready_rinq)
+        feersum_drain_write_ready(server);
+#ifdef FEERSUM_HAS_H2
+    if (server->h2_flush_rinq)
+        h2_drain_flush_rinq(server);
+#endif
     if (server->response_cleanup_rinq) {
         dTHX;
         feersum_drain_response_cleanup(aTHX_ server);
     }
-    if (!server->request_ready_rinq && !server->response_cleanup_rinq)
+    if (!server->request_ready_rinq && !server->response_cleanup_rinq
+        && !server->write_ready_rinq
+#ifdef FEERSUM_HAS_H2
+        && !server->h2_flush_rinq
+#endif
+        )
         ev_idle_stop(EV_A, w);
 }
 
@@ -1415,7 +1491,15 @@ handle_keepalive_or_close(struct feer_conn *c, conn_read_cb_t read_cb)
                 SvCUR_set(c->rbuf, 0);
                 if (SvLEN(c->rbuf) > READ_BUFSZ * 4)
                     SvPV_renew(c->rbuf, READ_BUFSZ + 1);
-                SvREFCNT_dec(tmp);
+                /* before the size test: a chopped body hides its length in OOK */
+                SvOOK_off(tmp);
+                if (!c->rbuf_spare && SvREFCNT(tmp) == 1 && !SvMAGICAL(tmp)
+                    && SvLEN(tmp) <= READ_BUFSZ * 4) {
+                    SvPOK_only(tmp);
+                    SvCUR_set(tmp, 0);
+                    c->rbuf_spare = tmp;
+                } else
+                    SvREFCNT_dec(tmp);
             } else if (c->req->buf) {
                 SvREFCNT_dec(c->req->buf);
                 c->req->buf = NULL;
@@ -1428,7 +1512,6 @@ handle_keepalive_or_close(struct feer_conn *c, conn_read_cb_t read_cb)
             c->pipelined = pipelined;
             if (c->pipeline_depth <= MAX_PIPELINE_DEPTH) {
                 c->pipeline_depth++;
-                restart_header_timer(c);
                 read_cb(feersum_ev_loop, &c->read_ev_io, 0);
                 c->pipeline_depth--;
                 /* try_tls_conn_read never arms a watcher itself: a partial
@@ -1445,7 +1528,6 @@ handle_keepalive_or_close(struct feer_conn *c, conn_read_cb_t read_cb)
         /* the drain sample belongs to the response just finished */
         c->prev_read_outq = 0;
         restart_read_timer(c);
-        restart_header_timer(c);
         feer_conn_set_idle(c);
     } else {
         /* Not a bare safe_close_conn: the read watcher may still be armed (a

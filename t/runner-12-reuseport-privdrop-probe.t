@@ -14,9 +14,9 @@ BEGIN {
 
 use Feersum::Runner ();
 
-plan skip_all => 'SO_REUSEPORT not available on this platform'
-    unless defined &Feersum::Runner::SO_REUSEPORT
-       && defined Feersum::Runner::SO_REUSEPORT();
+# the constant can exist where the kernel rejects the option
+plan skip_all => 'SO_REUSEPORT not usable on this system'
+    unless bless({ reuseport => 1, pre_fork => 2 }, 'Feersum::Runner')->_reuseport_enabled;
 
 plan tests => 8;
 

@@ -22,6 +22,8 @@
 /* tls_wbuf cap: h2_send_cb returns WOULDBLOCK past it so frames stay queued and
  * nghttp2's own outbound-queue flood detection can fire */
 #define FEER_H2_MAX_WBUF (16 * 1024 * 1024)
+/* small frames are packed into one TLS record; frames past half go direct */
+#define H2_STAGE_SZ 4096
 
 /* Silent read_timeout intervals with output pending before a conn counts as stalled */
 #define FEER_H2_STALL_STRIKES 3

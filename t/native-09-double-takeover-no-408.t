@@ -35,9 +35,12 @@ if ($pid == 0) {
     my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $port,
         Proto => 'tcp', Timeout => 5 * TMULT) or $fail->("connect: $!");
     syswrite($c, "GET / HTTP/1.1\015\012Host: x\015\012\015\012");
-    # header_timeout is a fixed 1s, so 2s of silence (not TMULT-scaled) proves no 408
+    # stay silent for twice header_timeout: long enough that a deadline which
+    # did touch the app-owned socket would have fired inside the window.  Both
+    # scale, or a loaded box has no room between the request landing and the
+    # takeover taking effect, and reads the resulting close as an early eof.
     my $got = '';
-    my $deadline = time() + 2;
+    my $deadline = time() + 2 * TMULT;
     while (time() < $deadline) {
         my $rin = '';
         vec($rin, fileno($c), 1) = 1;
@@ -48,6 +51,8 @@ if ($pid == 0) {
         $got .= $buf;
     }
     if (length $got) { $fail->("early bytes: $got"); }
+    open my $quiet, '>', "$dir/quiet" or POSIX::_exit(9);
+    close $quiet;
     my $fin = '';
     eval {
         local $SIG{ALRM} = sub { die "timeout\n" };
@@ -63,7 +68,7 @@ if ($pid == 0) {
 }
 
 my $s = Feersum->new();
-$s->header_timeout(1);
+$s->header_timeout(1 * TMULT);
 $s->use_socket($lsn);
 my ($took_twice, $held);
 $s->request_handler(sub {
@@ -74,7 +79,12 @@ $s->request_handler(sub {
     $took_twice = 1;
 });
 my $cv = AE::cv;
-my $t = AE::timer 2 + 1 * TMULT, 0, sub {   # after the child's 2s silence window
+# reply once the child says its silence window is over: a fixed delay raced a
+# child the scheduler started late
+my $give_up = AE::now + 30 * TMULT;
+my $t; $t = AE::timer 0.05, 0.05, sub {
+    return unless -e "$dir/quiet" || -e "$dir/status" || AE::now > $give_up;
+    undef $t;
     if ($held) {
         $held->autoflush(1);
         print {$held} "HTTP/1.1 200 OK\015\012Content-Length: 6\015\012"

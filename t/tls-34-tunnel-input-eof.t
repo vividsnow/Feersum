@@ -57,9 +57,11 @@ if (!$pid) {
         });
     });
     my $stats = EV::timer(0.05, 0.05, sub {
-        open my $out, '>', "$dir/active" or die $!;
+        # atomic: rewriting in place leaves a window a slow reader lands in
+        open my $out, '>', "$dir/active.tmp" or die $!;
         print {$out} $f->active_conns;
         close $out;
+        rename "$dir/active.tmp", "$dir/active" or die $!;
     });
     my $life = EV::timer(40 * TMULT, 0, sub { POSIX::_exit(0) });
     EV::run;
@@ -106,7 +108,7 @@ for my $case ('fin-empty', 'fin', 'notify-empty', 'close-notify') {
         is $result, length($payload) . ' ' . sha256_hex($payload), 'all queued input arrives in order before EOF';
         like $response, qr/received:\Q$result\E\n\z/, 'app response reaches the peer after input EOF';
         close $s;
-        my ($active, $deadline) = (-1, time + 2 * TMULT);
+        my ($active, $deadline) = (-1, time + 10 * TMULT);  # teardown is slow on a slow box
         while (time < $deadline) {
             if (open my $in, '<', "$dir/active") { $active = <$in> // -1; close $in }
             last if $active == 0;

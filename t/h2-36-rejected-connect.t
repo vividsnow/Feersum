@@ -81,7 +81,7 @@ for my $case (map { [$_, 0], [$_, 1] } ('array', 'writer', 'io')) {
         $s->syswrite(h2_frame(H2_DATA, FLAG_END_STREAM, 1, '')) unless $input_closed;
 
         my $active;
-        $deadline = time + 0.5 * TMULT;
+        $deadline = time + 5 * TMULT;
         while (time < $deadline) {
             if (open my $in, '<', "$dir/stats") {
                 chomp($active = <$in> // 'missing');

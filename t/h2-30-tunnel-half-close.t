@@ -75,7 +75,9 @@ my $cleanup = guard { reap_server($pid) };
 close $listen;
 
 my $large_payload = join('', map { pack('N', $_) } 0 .. 131071);  # 512 KiB, larger than the socketpair
-for my $case ('headers-empty', 'data', 'before-setup', 'trailers', 'close-notify', 'fin', 'notify-before-setup') {
+# No trailers case: on a connected CONNECT stream anything but DATA/RST/WINDOW_UPDATE
+# /PRIORITY is a stream error (RFC 9113 8.5), so END_STREAM on DATA is the half-close.
+for my $case ('headers-empty', 'data', 'before-setup', 'close-notify', 'fin', 'notify-before-setup') {
     subtest $case => sub {
         my $transport_eof = $case eq 'fin' || $case =~ /notify/;
         my $payload = $case eq 'headers-empty' ? '' : $large_payload;
@@ -115,7 +117,7 @@ for my $case ('headers-empty', 'data', 'before-setup', 'trailers', 'close-notify
             my $n = length($payload) - $offset;
             $n = 16000 if $n > 16000;
             if ($conn_window >= $n && $stream_window >= $n) {
-                my $end = $case ne 'trailers' && !$transport_eof
+                my $end = !$transport_eof
                     && $offset + $n == length($payload) ? FLAG_END_STREAM : 0;
                 my $frame = h2_frame(H2_DATA, $end, 1, substr($payload, $offset, $n));
                 $s->blocking(1);
@@ -133,10 +135,6 @@ for my $case ('headers-empty', 'data', 'before-setup', 'trailers', 'close-notify
             while (my $frame = h2_read_frame($s, 0.005)) { $receive->($frame) }
         }
         is $offset, length($payload), 'client sends the complete payload within the flow-control windows';
-        if ($case eq 'trailers') {
-            $s->syswrite(h2_frame(H2_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1,
-                hpack_encode_headers(['x-finished', 'yes'])));
-        }
         if ($transport_eof) {
             $s->blocking(1);
             if ($case eq 'fin') { CORE::shutdown($s, SHUT_WR) or die "shutdown: $!" }

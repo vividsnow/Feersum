@@ -71,9 +71,11 @@ if ($pid == 0) {
     }
     POSIX::_exit(13) unless $raw =~ m{^HTTP/1\.1 200}mi;
     sleep 1.5; # saturate the poll-retry backoff ladder while the peer is live
-    open my $fh, '>', "$dir/fin.mark" or POSIX::_exit(14);
+    # atomic: the sampler polls every 20ms and -f turns true at create
+    open my $fh, '>', "$dir/fin.mark.tmp" or POSIX::_exit(14);
     print $fh time, "\n";
     close $fh;
+    rename "$dir/fin.mark.tmp", "$dir/fin.mark" or POSIX::_exit(14);
     CORE::shutdown($cli, SHUT_WR) or POSIX::_exit(15);
     $dl = time + 8;
     while (time < $dl) {

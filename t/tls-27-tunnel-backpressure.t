@@ -60,20 +60,25 @@ if (!$server) {
             # counting iterations would push far more than $WANT.
             my $sent = 0;
             my $chunk = 'Z' x (256 * 1024);
+            # paced by writability, not a timer: BSD timers tick at 10 ms and
+            # their socketpairs are small, so one write per tick crawls
             my $t;
-            $t = EV::timer 0, 0.001, sub {
-                if ($sent >= $WANT) {
-                    undef $t;
-                    if ($close_at_end) {
-                        close $io;                   # EOF for the reader
-                        delete $keep{$id};
+            $t = EV::io $io, EV::WRITE, sub {
+                while ($sent < $WANT) {
+                    my $n = $WANT - $sent;
+                    $n = length $chunk if $n > length $chunk;
+                    my $w = syswrite $io, substr($chunk, 0, $n);
+                    if (!$w) {
+                        return if $!{EAGAIN} || $!{EWOULDBLOCK};
+                        last;
                     }
-                    return;
+                    $sent += $w;
                 }
-                my $n = $WANT - $sent;
-                $n = length $chunk if $n > length $chunk;
-                my $w = syswrite $io, substr($chunk, 0, $n);
-                $sent += $w if defined $w;
+                undef $t;
+                if ($close_at_end) {
+                    close $io;                   # EOF for the reader
+                    delete $keep{$id};
+                }
             };
             $keep{$id} = [$io, \$t];
         };

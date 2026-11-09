@@ -266,6 +266,34 @@ feer_tls_init_conn(struct feer_conn *c, struct feer_tls_ctx_ref *ref)
 }
 
 static void
+feer_tls_rbuf_release(struct feer_conn *c)
+{
+    if (c->tls_rbuf_base)
+        Safefree(c->tls_rbuf_base);
+    c->tls_rbuf = c->tls_rbuf_base = NULL;
+    c->tls_rbuf_len = 0;
+}
+
+/* before the borrowed read buffer goes out of scope */
+static void
+feer_tls_rbuf_own(struct feer_conn *c)
+{
+    if (c->tls_rbuf_base) return;
+    if (c->tls_rbuf_len == 0) { c->tls_rbuf = NULL; return; }
+    uint8_t *p;
+    Newx(p, c->tls_rbuf_len, uint8_t);
+    memcpy(p, c->tls_rbuf, c->tls_rbuf_len);
+    c->tls_rbuf = c->tls_rbuf_base = p;
+}
+
+static inline void
+feer_tls_decbuf_done(ptls_buffer_t *b)
+{
+    if (b->is_allocated)
+        ptls_buffer_dispose(b);
+}
+
+static void
 feer_tls_free_conn(struct feer_conn *c)
 {
     if (c->tls) {
@@ -277,11 +305,7 @@ feer_tls_free_conn(struct feer_conn *c)
         c->tls_ctx_ref = NULL;
     }
     ptls_buffer_dispose(&c->tls_wbuf);
-    if (c->tls_rbuf) {
-        Safefree(c->tls_rbuf);
-        c->tls_rbuf = NULL;
-        c->tls_rbuf_len = 0;
-    }
+    feer_tls_rbuf_release(c);
     if (c->tls_tunnel) {
         ev_io_stop(feersum_ev_loop, &c->tls_tunnel_read_w);
         ev_io_stop(feersum_ev_loop, &c->tls_tunnel_write_w);
@@ -310,7 +334,8 @@ feer_tls_flush_wbuf(struct feer_conn *c)
     if (c->tls_wbuf.off == 0)
         return 0;
 
-    ssize_t written = write(c->fd, c->tls_wbuf.base, c->tls_wbuf.off);
+    size_t pending = c->tls_wbuf.off - c->tls_wbuf_sent;
+    ssize_t written = write(c->fd, c->tls_wbuf.base + c->tls_wbuf_sent, pending);
     if (written < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             return -1;
@@ -330,15 +355,57 @@ feer_tls_flush_wbuf(struct feer_conn *c)
     }
 #endif
 
-    if ((size_t)written < c->tls_wbuf.off) {
-        memmove(c->tls_wbuf.base, c->tls_wbuf.base + written,
-                c->tls_wbuf.off - written);
-        c->tls_wbuf.off -= written;
+    if ((size_t)written < pending) {
+        c->tls_wbuf_sent += written;
+        /* compact only once the sent prefix outweighs the unsent tail */
+        size_t live = c->tls_wbuf.off - c->tls_wbuf_sent;
+        if (c->tls_wbuf_sent >= live) {
+            memmove(c->tls_wbuf.base, c->tls_wbuf.base + c->tls_wbuf_sent, live);
+            c->tls_wbuf.off = live;
+            c->tls_wbuf_sent = 0;
+        }
         return (int)written;
     }
 
     c->tls_wbuf.off = 0;
+    c->tls_wbuf_sent = 0;
     return (int)written;
+}
+
+static void
+feer_tls_note_idle(struct feer_conn *c)
+{
+    if (!c->tls || c->tls_wbuf.capacity <= FEER_TLS_WBUF_KEEP) return;
+    c->tls_wbuf_quiet = 0;
+    /* not once unlisten() has stopped check_cb: it would hold the loop open */
+    if (!ev_is_active(&c->server->tls_wbuf_trim_w)
+        && ev_is_active(&c->server->ec))
+        ev_timer_start(feersum_ev_loop, &c->server->tls_wbuf_trim_w);
+}
+
+/* marked on one tick, trimmed on the next: only a conn idle a whole interval */
+static void
+tls_wbuf_trim_cb(EV_P_ ev_timer *w, int revents)
+{
+    struct feer_server *server = (struct feer_server *)w->data;
+    struct rinq *head = server->idle_keepalive_rinq, *n = head;
+    int oversized = 0;
+    PERL_UNUSED_VAR(revents);
+    if (n) do {
+        struct feer_conn *c = (struct feer_conn *)n->ref;
+        if (c->tls && c->tls_wbuf.capacity > FEER_TLS_WBUF_KEEP) {
+            if (c->tls_wbuf_quiet && c->tls_wbuf.off == 0) {
+                ptls_buffer_dispose(&c->tls_wbuf);
+                ptls_buffer_init(&c->tls_wbuf, "", 0);
+            } else {
+                c->tls_wbuf_quiet = 1;
+                oversized = 1;
+            }
+        }
+        n = n->next;
+    } while (n != head);
+    if (!oversized)
+        ev_timer_stop(EV_A, w);
 }
 
 
@@ -417,16 +484,16 @@ tls_tunnel_write_or_buffer(struct feer_conn *c, const char *data, size_t len)
     return 0;
 }
 
-static int feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf);
+static int feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf, uint8_t *scratch);
 
 static void
-drain_tls_tunnel_rbuf(struct feer_conn *c)
+drain_tls_tunnel_rbuf(struct feer_conn *c, uint8_t *scratch)
 {
     while (c->tls_tunnel && c->tls_rbuf_len > 0) {
         if (ev_is_active(&c->tls_tunnel_write_w))
             break; /* sv[0] full - let write watcher drain first */
         ptls_buffer_t db;
-        int drain_rv = feer_tls_drain_one_record(c, &db);
+        int drain_rv = feer_tls_drain_one_record(c, &db, scratch);
         if (unlikely(drain_rv == -2)) {
             feer_shutdown_conn(c, "TLS receive error (tunnel drain)");
             return;
@@ -558,9 +625,10 @@ tls_tunnel_sv0_write_cb(EV_P_ struct ev_io *w, int revents)
         SvCUR_set(c->tls_tunnel_wbuf, 0);
         c->tls_tunnel_wbuf_pos = 0;
 
-        if (c->tls_rbuf_len > 0)
-            drain_tls_tunnel_rbuf(c);
-        else
+        if (c->tls_rbuf_len > 0) {
+            uint8_t scratch[TLS_DEC_SCRATCH];
+            drain_tls_tunnel_rbuf(c, scratch);
+        } else
             tls_tunnel_maybe_send_input_eof(c);
     }
 
@@ -617,6 +685,7 @@ feer_tls_save_rbuf(struct feer_conn *c, const uint8_t *src, size_t len)
 {
     Newx(c->tls_rbuf, len, uint8_t);
     memcpy(c->tls_rbuf, src, len);
+    c->tls_rbuf_base = c->tls_rbuf;
     c->tls_rbuf_len = len;
 }
 
@@ -633,24 +702,21 @@ feer_tls_note_alert(struct feer_conn *c, int ret)
  * (KeyUpdate, NewSessionTicket), retry while tls_rbuf remains; -1: nothing
  * left or peer close_notify; -2: undecryptable, caller must tear down */
 static int
-feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf)
+feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf, uint8_t *scratch)
 {
     if (!c->tls_rbuf || c->tls_rbuf_len == 0) return -1;
+    ptls_buffer_init(decbuf, scratch, TLS_DEC_SCRATCH);
 
-    uint8_t *saved = c->tls_rbuf;
-    size_t saved_len = c->tls_rbuf_len;
-    c->tls_rbuf = NULL;
-    c->tls_rbuf_len = 0;
-
-    ptls_buffer_init(decbuf, "", 0);
-    size_t consumed = saved_len;
-    int ret = ptls_receive(c->tls, decbuf, saved, &consumed);
-    if (ret == 0 && consumed < saved_len)
-        feer_tls_save_rbuf(c, saved + consumed, saved_len - consumed);
-    Safefree(saved);
+    size_t consumed = c->tls_rbuf_len;
+    int ret = ptls_receive(c->tls, decbuf, c->tls_rbuf, &consumed);
+    if (ret == 0 && consumed < c->tls_rbuf_len) {
+        c->tls_rbuf += consumed;
+        c->tls_rbuf_len -= consumed;
+    } else
+        feer_tls_rbuf_release(c);
 
     if (ret != 0) {
-        ptls_buffer_dispose(decbuf);
+        feer_tls_decbuf_done(decbuf);
         /* close_notify arrives as an error but must not tear down here: a
          * request coalesced ahead of it is decrypted and still owed a response */
         if (ret == PTLS_ERROR_CLASS_PEER_ALERT + PTLS_ALERT_CLOSE_NOTIFY) {
@@ -662,7 +728,7 @@ feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf)
         return -2;
     }
     if (decbuf->off == 0) {
-        ptls_buffer_dispose(decbuf);
+        feer_tls_decbuf_done(decbuf);
         return 1;
     }
     return 0;
@@ -671,7 +737,8 @@ feer_tls_drain_one_record(struct feer_conn *c, ptls_buffer_t *decbuf)
 /* Appends decbuf and every further complete record to rbuf; disposes decbuf.
  * Returns bytes appended; *failed is set when a record would not decrypt */
 static size_t
-feer_tls_rbuf_append_drain(struct feer_conn *c, ptls_buffer_t *decbuf, int *failed)
+feer_tls_rbuf_append_drain(struct feer_conn *c, ptls_buffer_t *decbuf, int *failed,
+                           uint8_t *scratch)
 {
     dTHX;
     size_t added = 0;
@@ -681,16 +748,16 @@ feer_tls_rbuf_append_drain(struct feer_conn *c, ptls_buffer_t *decbuf, int *fail
         sv_catpvn(c->rbuf, (const char *)decbuf->base, decbuf->off);
         added = decbuf->off;
     }
-    ptls_buffer_dispose(decbuf);
+    feer_tls_decbuf_done(decbuf);
     ptls_buffer_t db;
     int drain_rv;
-    while ((drain_rv = feer_tls_drain_one_record(c, &db)) >= 0) {
+    while ((drain_rv = feer_tls_drain_one_record(c, &db, scratch)) >= 0) {
         if (drain_rv == 1) continue; /* non-data TLS record */
         if (!c->rbuf)
             c->rbuf = newSV_buf(db.off + READ_BUFSZ);
         sv_catpvn(c->rbuf, (const char *)db.base, db.off);
         added += db.off;
-        ptls_buffer_dispose(&db);
+        feer_tls_decbuf_done(&db);
     }
     if (unlikely(drain_rv == -2))
         *failed = 1;
@@ -699,13 +766,13 @@ feer_tls_rbuf_append_drain(struct feer_conn *c, ptls_buffer_t *decbuf, int *fail
 
 #ifdef FEERSUM_HAS_H2
 static void
-drain_h2_tls_records(struct feer_conn *c)
+drain_h2_tls_records(struct feer_conn *c, uint8_t *scratch)
 {
     dTHX;
     while (c->h2_session && c->fd >= 0
            && !c->closing_linger && !c->h2_close_pending) {
         ptls_buffer_t db;
-        int drain_rv = feer_tls_drain_one_record(c, &db);
+        int drain_rv = feer_tls_drain_one_record(c, &db, scratch);
         if (unlikely(drain_rv == -2)) {
             stop_all_watchers(c);
             safe_close_conn(c, "TLS receive error (H2 drain)");
@@ -714,7 +781,7 @@ drain_h2_tls_records(struct feer_conn *c)
         if (drain_rv < 0) break;
         if (drain_rv == 1) continue; /* non-data TLS record */
         feer_h2_session_recv(c, db.base, db.off);
-        ptls_buffer_dispose(&db);
+        feer_tls_decbuf_done(&db);
         if (c->fd < 0) break;
         h2_session_send_and_poll(aTHX_ c);
         restart_read_timer(c);
@@ -764,6 +831,7 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
     trace("tls_conn_read fd=%d hs_done=%d\n", c->fd, c->tls_handshake_done);
 
     ssize_t got_n = 0;
+    uint8_t *merged_late = NULL;
 
     if (unlikely(c->pipelined)) goto tls_pipelined;
     if (unlikely(c->tls_input_eof)) goto tls_read_cleanup;
@@ -777,6 +845,8 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
     }
 
     uint8_t rawbuf[TLS_RAW_BUFSZ];
+    /* one decrypt buffer per callback: each record is consumed before the next */
+    uint8_t scratch[TLS_DEC_SCRATCH];
     ssize_t nread = read(c->fd, rawbuf, sizeof(rawbuf));
 
     if (nread == 0) {
@@ -786,7 +856,7 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
          * owes the peer */
         if (c->tls_tunnel && c->tls_tunnel_sv0 >= 0 && !c->tls_tunnel_eof) {
             tls_tunnel_note_input_eof(c);
-            drain_tls_tunnel_rbuf(c);
+            drain_tls_tunnel_rbuf(c, scratch);
             goto tls_read_cleanup;
         }
         tls_tunnel_note_input_eof(c);
@@ -850,14 +920,14 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
             memcpy(merged, c->tls_rbuf, c->tls_rbuf_len);
             memcpy(merged + c->tls_rbuf_len, rawbuf, (size_t)nread);
             inbuf = merged;
-            Safefree(c->tls_rbuf);
+            Safefree(c->tls_rbuf_base);
         } else {
             /* PROXY leftover only - transfer ownership to merged, no copy */
-            merged = c->tls_rbuf;
-            inbuf = merged;
+            merged = c->tls_rbuf_base;
+            inbuf = c->tls_rbuf;
             inlen = c->tls_rbuf_len;
         }
-        c->tls_rbuf = NULL;
+        c->tls_rbuf = c->tls_rbuf_base = NULL;
         c->tls_rbuf_len = 0;
     }
 
@@ -901,11 +971,11 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
 #ifdef FEERSUM_HAS_H2
                 if (c->h2_session) {
                     ptls_buffer_t decbuf;
-                    ptls_buffer_init(&decbuf, "", 0);
+                    ptls_buffer_init(&decbuf, scratch, TLS_DEC_SCRATCH);
                     size_t dec_consumed = remaining;
                     int dec_ret = ptls_receive(c->tls, &decbuf, extra, &dec_consumed);
                     if (dec_ret != 0) {
-                        ptls_buffer_dispose(&decbuf);
+                        feer_tls_decbuf_done(&decbuf);
                         if (merged) Safefree(merged);
                         feer_tls_note_alert(c, dec_ret);
                         stop_all_watchers(c);
@@ -917,7 +987,7 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
                     if (decbuf.off > 0) {
                         feer_h2_session_recv(c, decbuf.base, decbuf.off);
                     }
-                    ptls_buffer_dispose(&decbuf);
+                    feer_tls_decbuf_done(&decbuf);
                     if (c->fd < 0) {
                         if (merged) Safefree(merged);
                         goto tls_read_cleanup;
@@ -925,18 +995,18 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
                     h2_session_send_and_poll(aTHX_ c);
                     restart_read_timer(c);
 
-                    drain_h2_tls_records(c);
+                    drain_h2_tls_records(c, scratch);
 
                     if (merged) Safefree(merged);
                     goto tls_read_cleanup;
                 }
 #endif
                 ptls_buffer_t decbuf;
-                ptls_buffer_init(&decbuf, "", 0);
+                ptls_buffer_init(&decbuf, scratch, TLS_DEC_SCRATCH);
                 size_t dec_consumed = remaining;
                 int dec_ret = ptls_receive(c->tls, &decbuf, extra, &dec_consumed);
                 if (dec_ret != 0) {
-                    ptls_buffer_dispose(&decbuf);
+                    feer_tls_decbuf_done(&decbuf);
                     if (merged) Safefree(merged);
                     feer_tls_note_alert(c, dec_ret);
                     stop_all_watchers(c);
@@ -946,7 +1016,7 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
                 if (dec_consumed < remaining)
                     feer_tls_save_rbuf(c, extra + dec_consumed, remaining - dec_consumed);
                 int drain_failed = 0;
-                size_t added = feer_tls_rbuf_append_drain(c, &decbuf, &drain_failed);
+                size_t added = feer_tls_rbuf_append_drain(c, &decbuf, &drain_failed, scratch);
                 if (unlikely(drain_failed)) {
                     if (merged) Safefree(merged);
                     change_receiving_state(c, RECEIVE_SHUTDOWN);
@@ -976,18 +1046,22 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
 
     {
         ptls_buffer_t decbuf;
-        ptls_buffer_init(&decbuf, "", 0);
+        ptls_buffer_init(&decbuf, scratch, TLS_DEC_SCRATCH);
         size_t consumed = inlen;
         int ret = ptls_receive(c->tls, &decbuf, inbuf, &consumed);
 
-        if (ret == 0 && consumed < inlen)
-            feer_tls_save_rbuf(c, inbuf + consumed, inlen - consumed);
-
-        if (merged) Safefree(merged);
+        /* borrowed: drained in place, copied out once by feer_tls_rbuf_own */
+        if (ret == 0 && consumed < inlen) {
+            c->tls_rbuf = inbuf + consumed;
+            c->tls_rbuf_base = NULL;
+            c->tls_rbuf_len = inlen - consumed;
+        }
+        merged_late = merged;
+        merged = NULL;
 
         if (ret != 0) {
             trace("TLS receive error fd=%d ret=%d\n", c->fd, ret);
-            ptls_buffer_dispose(&decbuf);
+            feer_tls_decbuf_done(&decbuf);
             if (ret == PTLS_ERROR_CLASS_PEER_ALERT + PTLS_ALERT_CLOSE_NOTIFY) {
                 tls_tunnel_note_input_eof(c);
                 goto tls_read_cleanup;
@@ -1000,19 +1074,19 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
         }
 
         if (decbuf.off == 0) {
-            ptls_buffer_dispose(&decbuf);
+            feer_tls_decbuf_done(&decbuf);
             goto tls_read_cleanup; /* non-data record (KeyUpdate etc.) */
         }
 
 #ifdef FEERSUM_HAS_H2
         if (c->h2_session) {
             feer_h2_session_recv(c, decbuf.base, decbuf.off);
-            ptls_buffer_dispose(&decbuf);
+            feer_tls_decbuf_done(&decbuf);
             if (c->fd < 0) goto tls_read_cleanup;
             h2_session_send_and_poll(aTHX_ c);
             restart_read_timer(c);
 
-            drain_h2_tls_records(c);
+            drain_h2_tls_records(c, scratch);
 
             goto tls_read_cleanup;
         }
@@ -1020,20 +1094,20 @@ try_tls_conn_read(EV_P_ ev_io *w, int revents)
 
         if (c->tls_tunnel) {
             if (tls_tunnel_write_or_buffer(c, (const char *)decbuf.base, decbuf.off) < 0) {
-                ptls_buffer_dispose(&decbuf);
+                feer_tls_decbuf_done(&decbuf);
                 feer_shutdown_conn(c, "TLS tunnel write error");
                 goto tls_read_cleanup;
             }
-            ptls_buffer_dispose(&decbuf);
+            feer_tls_decbuf_done(&decbuf);
 
             /* Records coalesced in tls_rbuf would otherwise wait for the next read event */
-            drain_tls_tunnel_rbuf(c);
+            drain_tls_tunnel_rbuf(c, scratch);
 
             goto tls_read_cleanup;
         }
 
         int drain_failed = 0;
-        got_n = (ssize_t)feer_tls_rbuf_append_drain(c, &decbuf, &drain_failed);
+        got_n = (ssize_t)feer_tls_rbuf_append_drain(c, &decbuf, &drain_failed, scratch);
         if (unlikely(drain_failed)) {
             change_receiving_state(c, RECEIVE_SHUTDOWN);
             stop_all_watchers(c);
@@ -1048,6 +1122,8 @@ tls_pipelined:
     c->pipelined = 0;
 
 tls_parse:
+    feer_tls_rbuf_own(c);
+    if (merged_late) { Safefree(merged_late); merged_late = NULL; }
     restart_read_timer(c);
     begin_request_headers(c);
 
@@ -1130,6 +1206,8 @@ tls_parse:
     }
 
 tls_read_cleanup:
+    feer_tls_rbuf_own(c);
+    if (merged_late) Safefree(merged_late);
     tls_http_input_eof(c);
 #ifdef FEERSUM_HAS_H2
     /* a partial or non-data record may never reach session_send */
@@ -1145,6 +1223,7 @@ static int
 feer_tls_decline_drain(struct feer_conn *c)
 {
     uint8_t rawbuf[TLS_RAW_BUFSZ];
+    uint8_t scratch[TLS_DEC_SCRATCH];
     ssize_t n;
     do {
         n = recv(c->fd, rawbuf, sizeof(rawbuf), MSG_DONTWAIT);
@@ -1163,14 +1242,14 @@ feer_tls_decline_drain(struct feer_conn *c)
         memcpy(merged, c->tls_rbuf, c->tls_rbuf_len);
         memcpy(merged + c->tls_rbuf_len, rawbuf, (size_t)n);
         inbuf = merged;
-        Safefree(c->tls_rbuf);
-        c->tls_rbuf = NULL;
+        Safefree(c->tls_rbuf_base);
+        c->tls_rbuf = c->tls_rbuf_base = NULL;
         c->tls_rbuf_len = 0;
     }
 
     trace("TLS decline drain fd=%d bytes=%"Sz_uf"\n", c->fd, (Sz)inlen);
     ptls_buffer_t decbuf;
-    ptls_buffer_init(&decbuf, "", 0);
+    ptls_buffer_init(&decbuf, scratch, TLS_DEC_SCRATCH);
     size_t consumed = inlen;
     int ret = ptls_receive(c->tls, &decbuf, inbuf, &consumed);
     if (ret == 0 && consumed < inlen)
@@ -1178,7 +1257,7 @@ feer_tls_decline_drain(struct feer_conn *c)
     if (merged) Safefree(merged);
 
     if (ret != 0) {
-        ptls_buffer_dispose(&decbuf);
+        feer_tls_decbuf_done(&decbuf);
         if (ret == PTLS_ERROR_CLASS_PEER_ALERT + PTLS_ALERT_CLOSE_NOTIFY) {
             tls_tunnel_note_input_eof(c);
             feersum_note_input_eof(c);
@@ -1190,13 +1269,67 @@ feer_tls_decline_drain(struct feer_conn *c)
         return 1;
     }
     int drain_failed = 0;
-    feer_tls_rbuf_append_drain(c, &decbuf, &drain_failed);
+    feer_tls_rbuf_append_drain(c, &decbuf, &drain_failed, scratch);
     if (drain_failed)
         return 1;
     /* The read watcher is stopped while parked, so the read path's rbuf cap
      * never runs here; enforce it or a declining streamer buffers unbounded. */
     if (unlikely(c->rbuf && SvCUR(c->rbuf) > c->cached_max_read_buf))
         return 1;
+    return 0;
+}
+
+/* 0: m done, 1: stopped at the window (progress kept in m), -1: error.  gbuf
+ * is emptied first: a body's DESTROY may write here and must queue after it */
+static int
+tls_encrypt_iomatrix(struct feer_conn *c, struct iomatrix *m)
+{
+    uint8_t gbuf[TLS_GATHER_BUFSZ];
+    size_t glen = 0;
+    int ret = 0, full = 0;
+    unsigned int i;
+    for (i = m->offset; i < m->count; i++) {
+        size_t len = m->iov[i].iov_len;
+        if (len == 0) continue;
+        if (c->tls_wbuf.off + glen >= FEER_TLS_ENCRYPT_AHEAD) { full = 1; break; }
+
+        if (glen > 0 && (len >= sizeof(gbuf) || glen + len > sizeof(gbuf))) {
+            ret = ptls_send(c->tls, &c->tls_wbuf, gbuf, glen);
+            glen = 0;
+            if (ret != 0) break;
+        }
+        if (len >= sizeof(gbuf)) {
+            /* at least one full record, so a nearly full window adds no runt */
+            size_t room = c->tls_wbuf.off < FEER_TLS_ENCRYPT_AHEAD
+                ? FEER_TLS_ENCRYPT_AHEAD - c->tls_wbuf.off : 0;
+            size_t piece = len;
+            if (piece > room) piece = room < 16384 ? 16384 : room;
+            if (piece > len) piece = len;
+            ret = ptls_send(c->tls, &c->tls_wbuf, m->iov[i].iov_base, piece);
+            if (ret != 0) break;
+            c->wbuf_len -= piece;
+            if (piece < len) {
+                m->iov[i].iov_base = (char *)m->iov[i].iov_base + piece;
+                m->iov[i].iov_len -= piece;
+                full = 1;
+                break;
+            }
+            continue;
+        }
+        c->wbuf_len -= len;
+        memcpy(gbuf + glen, m->iov[i].iov_base, len);
+        glen += len;
+    }
+    if (ret == 0 && glen > 0)
+        ret = ptls_send(c->tls, &c->tls_wbuf, gbuf, glen);
+    if (ret != 0) {
+        trouble("ptls_send error fd=%d ret=%d\n", c->fd, ret);
+        return -1;
+    }
+    if (full) {
+        m->offset = i;
+        return 1;
+    }
     return 0;
 }
 
@@ -1288,28 +1421,17 @@ try_tls_conn_write(EV_P_ ev_io *w, int revents)
     }
 
     /* wbuf_rinq before sendfile: headers first */
-    if (c->wbuf_rinq) {
+    while (c->wbuf_rinq) {
         struct iomatrix *m;
-        while ((m = (struct iomatrix *)rinq_shift(&c->wbuf_rinq)) != NULL) {
+        int window_full = 0;
+        while ((m = c->wbuf_rinq ? (struct iomatrix *)c->wbuf_rinq->ref : NULL)) {
+            int ret = tls_encrypt_iomatrix(c, m);
+            if (ret > 0) { window_full = 1; break; }
+            (void)rinq_shift(&c->wbuf_rinq);
             unsigned int i;
-            for (i = 0; i < m->count; i++) {
-                if (m->iov[i].iov_len == 0) continue;
-
-                c->wbuf_len -= m->iov[i].iov_len;
-
-                int ret = ptls_send(c->tls, &c->tls_wbuf,
-                                    m->iov[i].iov_base, m->iov[i].iov_len);
-                if (ret != 0) {
-                    unsigned int j;
-                    trouble("ptls_send error fd=%d ret=%d\n", c->fd, ret);
-                    for (j = 0; j < m->count; j++) SvREFCNT_dec(m->sv[j]);
-                    IOMATRIX_FREE(m);
-                    goto tls_write_error;
-                }
-            }
-
             for (i = 0; i < m->count; i++) SvREFCNT_dec(m->sv[i]);
             IOMATRIX_FREE(m);
+            if (ret < 0) goto tls_write_error;
 
             /* Refill only once the wire has taken everything: an IO::Handle
              * body pumps to EOF, so refilling on an unflushed buffer piles the
@@ -1335,6 +1457,7 @@ try_tls_conn_write(EV_P_ ev_io *w, int revents)
         /* tls_write_finished needs tls_wbuf empty; falling through with a
          * remainder leaves nothing armed to drain it */
         if (c->tls_wbuf.off > 0) goto tls_write_again;
+        if (!window_full) break;
     }
 
     if (c->sendfile_fd >= 0 && c->sendfile_remain > 0) {

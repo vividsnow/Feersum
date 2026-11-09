@@ -9,30 +9,6 @@ fileno (feer_conn_handle *hdl)
     OUTPUT:
         RETVAL
 
-void
-DESTROY (SV *self)
-    ALIAS:
-        Feersum::Connection::Reader::DESTROY = 1
-        Feersum::Connection::Writer::DESTROY = 2
-    PPCODE:
-{
-    feer_conn_handle *hdl = sv_2feer_conn_handle(self, 0);
-
-    if (hdl == NULL) {
-        trace3("DESTROY handle (closed) class=%s\n",
-            HvNAME(SvSTASH(SvRV(self))));
-    }
-    else {
-        struct feer_conn *c = (struct feer_conn *)hdl;
-        trace3("DESTROY handle fd=%d, class=%s\n", c->fd,
-            HvNAME(SvSTASH(SvRV(self))));
-        if (ix == 2)
-            feersum_close_handle(aTHX_ c, 1);
-        else
-            SvREFCNT_dec(c->self); // reader: balance new_feer_conn_handle
-    }
-}
-
 SV*
 read (feer_conn_handle *hdl, SV *buf, size_t len, ...)
     PROTOTYPE: $$$;$
@@ -1106,6 +1082,7 @@ DESTROY (struct feer_conn *c)
     }
 
     SvREFCNT_dec(c->rbuf);
+    SvREFCNT_dec(c->rbuf_spare);
     SvREFCNT_dec((SV*)c->trailers);
     SvREFCNT_dec(c->proxy_tlvs);
 
@@ -1157,6 +1134,9 @@ DESTROY (struct feer_conn *c)
             ev_idle_stop(feersum_ev_loop, &server->ei);
             ev_prepare_stop(feersum_ev_loop, &server->ep);
             ev_check_stop(feersum_ev_loop, &server->ec);
+#ifdef FEERSUM_HAS_TLS
+            ev_timer_stop(feersum_ev_loop, &server->tls_wbuf_trim_w);
+#endif
 
             trace3("... was last conn, going to try shutdown\n");
             if (server->shutdown_cb_cv)

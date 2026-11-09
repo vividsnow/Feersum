@@ -31,11 +31,15 @@ sub not_running {
     my $pid = shift;
     waitpid($pid, POSIX::WNOHANG());           # reap it if it reparented to us
     return 1 unless kill 0, $pid;              # truly gone
+    my $state;
     if (open my $st, '<', "/proc/$pid/stat") { # Linux: a zombie is dead
-        my $state = (split ' ', scalar(<$st> // ''))[2] // '';
-        return 1 if $state eq 'Z';
+        $state = (split ' ', scalar(<$st> // ''))[2];
     }
-    return 0;
+    else {
+        $state = `ps -o stat= -p $pid 2>/dev/null`;
+        $state =~ s/^\s+// if defined $state;
+    }
+    return ($state // '') =~ /^Z/ ? 1 : 0;
 }
 
 my @scenarios = ('retirement deadline', 'shutdown during retirement',
@@ -121,7 +125,11 @@ MASTER
                 if (waitpid($master, POSIX::WNOHANG()) == $master) { $reaped = 1; return 1 }
                 return 0;
             }, 10 * TMULT), 'master exits within the shutdown budget';
-            ok not_running($old), 'master leaves no retired generation running';
+            # Timer slack can fire the shutdown backstop with the retirement
+            # deadline; the master then exits leaving its kill for init to reap.
+            ok await(sub { not_running($old) }, 5 * TMULT),
+                'master leaves no retired generation running'
+                or diag slurp("$dir/master.log");
             like slurp("$dir/master.log"), qr/restarting in .*failure 1/,
                 'reload resets the generation lifetime used for crash backoff'
                 if $scenario == 3;

@@ -182,48 +182,52 @@ for my $transport (@transports) {
         is $f->active_conns, 0, 'reused connections and streams are released';
 
         @completed = ();
-        run_client 'cancel guarded response', sub {
-            my $s = connect_client($transport, $port) or return 30;
-            if ($transport eq 'h2') {
-                my $request = h2_frame(H2_SETTINGS, 0, 0, pack('nN', 4, 0)) . h2_request(1, '/abort');
-                return 31 unless $s->syswrite($request) == length($request);
-                my $headers = h2_read_until($s, H2_HEADERS, 1, 3 * TMULT);
-                return 32 unless $headers && hpack_decode_status($headers->{payload}) == 200;
-                my $before = h2_request(3, '/probe')
-                    . h2_frame(H2_WINDOW_UPDATE, 0, 3, pack('N', 65535));
-                return 33 unless $s->syswrite($before) == length($before);
-                return 34 unless (read_h2_response($s, 3) // 'missing') eq '';
-                $s->syswrite(h2_frame(H2_RST_STREAM, 0, 1, pack('N', 8)));
-                # cleanup runs at the loop boundary, so a probe sent beside the
-                # reset may precede it; the next probe must see the fired guard
-                my $fired = 0;
-                for my $id (5, 7) {
-                    my $probe_request = h2_request($id, '/probe')
-                        . h2_frame(H2_WINDOW_UPDATE, 0, $id, pack('N', 65535));
-                    return 35 unless $s->syswrite($probe_request) == length($probe_request);
-                    if ((read_h2_response($s, $id) // '') eq '/abort') { $fired = 1; last }
+        SKIP: {
+            skip 'this kernel does not fail writes to an aborted peer', 8
+                if $transport ne 'h2' && !aborted_peer_fails_writes();
+            run_client 'cancel guarded response', sub {
+                my $s = connect_client($transport, $port) or return 30;
+                if ($transport eq 'h2') {
+                    my $request = h2_frame(H2_SETTINGS, 0, 0, pack('nN', 4, 0)) . h2_request(1, '/abort');
+                    return 31 unless $s->syswrite($request) == length($request);
+                    my $headers = h2_read_until($s, H2_HEADERS, 1, 3 * TMULT);
+                    return 32 unless $headers && hpack_decode_status($headers->{payload}) == 200;
+                    my $before = h2_request(3, '/probe')
+                        . h2_frame(H2_WINDOW_UPDATE, 0, 3, pack('N', 65535));
+                    return 33 unless $s->syswrite($before) == length($before);
+                    return 34 unless (read_h2_response($s, 3) // 'missing') eq '';
+                    $s->syswrite(h2_frame(H2_RST_STREAM, 0, 1, pack('N', 8)));
+                    # cleanup runs at the loop boundary, so a probe sent beside the
+                    # reset may precede it; the next probe must see the fired guard
+                    my $fired = 0;
+                    for my $id (5, 7) {
+                        my $probe_request = h2_request($id, '/probe')
+                            . h2_frame(H2_WINDOW_UPDATE, 0, $id, pack('N', 65535));
+                        return 35 unless $s->syswrite($probe_request) == length($probe_request);
+                        if ((read_h2_response($s, $id) // '') eq '/abort') { $fired = 1; last }
+                    }
+                    return 36 unless $fired;
+                    $s->close;
+                } else {
+                    my $request = "GET /abort HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+                    return 37 unless $s->syswrite($request) == length($request);
+                    return 38 unless defined read_http_response($s, 0);
+                    setsockopt($s, SOL_SOCKET, SO_LINGER, pack('ii', 1, 0)) or return 39;
+                    $transport =~ /^plain/ ? $s->close : $s->close(SSL_no_shutdown => 1);
                 }
-                return 36 unless $fired;
-                $s->close;
-            } else {
-                my $request = "GET /abort HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
-                return 37 unless $s->syswrite($request) == length($request);
-                return 38 unless defined read_http_response($s, 0);
-                setsockopt($s, SOL_SOCKET, SO_LINGER, pack('ii', 1, 0)) or return 39;
-                $transport =~ /^plain/ ? $s->close : $s->close(SSL_no_shutdown => 1);
-            }
-            return 0;
-        };
-        wait_for_close($f);
-        is_deeply \@completed, ['/abort'], 'cancellation fires the guard once';
-        is scalar @cancelled_bytes, 1, 'guard records the cancelled download';
-        cmp_ok $cancelled_bytes[0] // $download_size, '<', $download_size,
-            'cleanup happens before the response finishes';
-        is $f->active_conns, 0, 'cancelled connections and streams are released';
-        is scalar keys %writers, 0, 'guard releases the app-held streaming writer';
-        my $drained = 0;
-        $f->graceful_shutdown(sub { $drained++ });
-        is $drained, 1, 'response guards do not prevent graceful shutdown';
+                return 0;
+            };
+            wait_for_close($f);
+            is_deeply \@completed, ['/abort'], 'cancellation fires the guard once';
+            is scalar @cancelled_bytes, 1, 'guard records the cancelled download';
+            cmp_ok $cancelled_bytes[0] // $download_size, '<', $download_size,
+                'cleanup happens before the response finishes';
+            is $f->active_conns, 0, 'cancelled connections and streams are released';
+            is scalar keys %writers, 0, 'guard releases the app-held streaming writer';
+            my $drained = 0;
+            $f->graceful_shutdown(sub { $drained++ });
+            is $drained, 1, 'response guards do not prevent graceful shutdown';
+        }
         done_testing;
     };
 }

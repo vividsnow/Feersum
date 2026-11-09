@@ -59,12 +59,14 @@ select undef, undef, undef, 0.5 * TIMEOUT_MULT;
 # openssl only turns a lone 'k'/'K' line into a KeyUpdate; a starved smoker can
 # batch stdin into one read() and send it as plaintext, which the server 400s,
 # so the spacing is scaled and that 400 signature is a skip, not a failure.
+# It also takes any read() starting with Q, C or R as a command (C reconnects),
+# so no request line may start with one.
 my $gap = TIMEOUT_MULT;
 my $cmd = q{(printf 'GET /one HTTP/1.1\r\nHost: x\r\n\r\n'; sleep } . $gap . q{; }
         . q{printf 'k\n'; sleep } . $gap . q{; }
         . q{printf 'GET /two HTTP/1.1\r\nHost: x\r\n\r\n'; sleep } . $gap . q{; }
         . q{printf 'K\n'; sleep } . $gap . q{; }
-        . q{printf 'GET /three HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'; sleep }
+        . q{printf 'GET /three HTTP/1.1\r\nHost: x\r\n\r\n'; sleep }
         . (2 * $gap) . q{) }
         . qq{| openssl s_client -quiet -no_ign_eof -connect 127.0.0.1:$port 2>&1};
 

@@ -90,8 +90,13 @@ like $m, qr{^dispatch /second$}m,
     'control: a client that stays gets its pipelined request served';
 
 $m = session(0);
-like $m, qr/^stream write failed$/m,
-    'the streaming write failed once the client was gone';
+SKIP: {
+    skip 'this kernel does not fail writes to an aborted peer', 1
+        unless aborted_peer_fails_writes();
+    like $m, qr/^stream write failed$/m,
+        'the streaming write failed once the client was gone'
+        or diag "markers:\n$m";
+}
 unlike $m, qr{^dispatch /second$}m,
     'the pipelined request was not dispatched to the gone peer'
     or diag "markers:\n$m";

@@ -63,15 +63,22 @@ SKIP: {
     skip "IPv6 bind to ::1 not available on this system", 6
         unless $ipv6_bind_works;
 
+    # the constant can exist where the kernel rejects the option
+    my $reuseport_works = bless({ reuseport => 1, pre_fork => 2 }, 'Feersum::Runner')
+        ->_reuseport_enabled;
     # Bracketed notation, with and without a port, on both paths.  Without the
     # fix the non-reuseport path handed '[::1]:0' straight to IO::Socket::INET
     # (IPv4-only) and died with "invalid port ':1]'".
     for my $reuseport (0, 1) {
-        for my $addr ('[::1]:0', '[::1]') {
-            my $s = eval { $runner->_create_socket($addr, $reuseport) };
-            ok $s, "Runner binds IPv6 '$addr' (reuseport=$reuseport)"
-                or diag $@;
-            close $s if $s;
+        SKIP: {
+            skip 'SO_REUSEPORT is not usable on this system', 2
+                if $reuseport && !$reuseport_works;
+            for my $addr ('[::1]:0', '[::1]') {
+                my $s = eval { $runner->_create_socket($addr, $reuseport) };
+                ok $s, "Runner binds IPv6 '$addr' (reuseport=$reuseport)"
+                    or diag $@;
+                close $s if $s;
+            }
         }
     }
     # The bound socket really is AF_INET6, not a v4 fallback.

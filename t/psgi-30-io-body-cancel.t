@@ -89,6 +89,9 @@ push @transports, 'https' if $tls;
 push @transports, 'h2', 'h2_reset' if $h2;
 for my $transport (@transports) {
     subtest "$transport interrupted download" => sub {
+        # H1 learns of the abort only from a failed write; H2 also reads it
+        plan skip_all => 'this kernel does not fail writes to an aborted peer'
+            if $transport !~ /^h2/ && !aborted_peer_fails_writes();
         my $s;
         if ($transport =~ /^h2/) {
             $s = h2_connect($ports[1]) or die 'H2 connect failed';

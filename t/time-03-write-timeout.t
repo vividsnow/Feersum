@@ -24,11 +24,15 @@ is $evh->write_timeout, 0, "write_timeout defaults to 0";
 my $wt = 1.0 * TIMEOUT_MULT;
 $evh->write_timeout($wt);
 is $evh->write_timeout, $wt, "write_timeout set to $wt";
+# read_timeout reaps a stalled reader too; keep it out of the window
+$evh->read_timeout(60 * TIMEOUT_MULT);
 
-# Streaming response that produces lots of data via poll_cb
+# Streaming response that produces lots of data via poll_cb; a dropped Writer
+# closes the response, so hold it
+my $writer_keep;
 $evh->request_handler(sub {
     my $r = shift;
-    my $w = $r->start_streaming(200, ["Content-Type" => "text/plain"]);
+    my $w = $writer_keep = $r->start_streaming(200, ["Content-Type" => "text/plain"]);
     $w->poll_cb(sub {
         my $writer = shift;
         # Keep producing data to fill kernel send buffer
@@ -39,51 +43,53 @@ $evh->request_handler(sub {
 my $cv = AE::cv;
 $cv->begin;
 
-# Use raw socket: connect, send request, then NEVER read.
-# Set socket buffers as small as possible to trigger stalling faster.
+# Use raw socket: connect, send request, then NEVER read.  Leave the receive
+# buffer alone: a tiny one trickles the reaped residue in slower than any EOF
+# deadline, and a peer that never reads stalls the writer regardless.
 my $raw = IO::Socket::INET->new(
     PeerAddr => '127.0.0.1',
     PeerPort => $port,
     Proto    => 'tcp',
 ) or die "connect: $!";
-$raw->sockopt(SO_RCVBUF, 1);  # minimize recv buffer
 $raw->syswrite("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
 
-# Wait long enough for: kernel buffers to fill + write_timeout to fire + margin
-# Don't read from the socket at all - just wait, then check.
-my $wait = ($wt + 5) * TIMEOUT_MULT;
-my $t; $t = AE::timer($wait, 0, sub {
-    undef $t;
-    # Now check: the server should have closed the connection.
-    # Try to read - if server closed, we get EOF (or data then EOF).
-    $raw->blocking(0);
-    my $buf;
-    my $n = $raw->sysread($buf, 65536);
-    if (defined($n) && $n == 0) {
-        pass "connection was closed (write timeout fired) - EOF";
-    }
-    elsif (defined($n) && $n > 0) {
-        # Got some data, try reading again for EOF
-        my $n2 = $raw->sysread($buf, 65536);
-        while (defined($n2) && $n2 > 0) {
-            $n2 = $raw->sysread($buf, 65536);
-        }
-        if (defined($n2) && $n2 == 0) {
-            pass "connection was closed (write timeout fired) - EOF after data";
-        } else {
-            fail "connection still open after timeout (got data but no EOF)";
-        }
-    }
-    else {
-        # EAGAIN or error
-        if ($!{EAGAIN} || $!{EWOULDBLOCK}) {
-            fail "connection still open after timeout (EAGAIN - server didn't close)";
-        } else {
-            pass "connection was closed (write timeout fired) - error: $!";
-        }
-    }
+# The server shares this process, so wait for it to drop the stalled socket
+# rather than guess a window: a peer buffer that keeps growing (macOS
+# autosizing) reads as draining and rightly defers the reap.  Never read before
+# then - reading is progress.  After it, the residue must end in EOF; an
+# unreaped connection would stream without end.
+my $t0 = AE::now;
+my ($got, $end, $done, $poll, $rw, $limit) = (0, '');
+my $finish = sub {
+    my ($why) = @_;
+    return if $done++;
+    undef $poll; undef $rw; undef $limit;
+    ok $end, "connection was closed (write timeout fired) - $end"
+        or diag $why // "read $got bytes without the connection ending";
     close $raw;
     $cv->end;
+};
+$poll = AE::timer(0.1, 0.1, sub {
+    return unless $writer_keep;   # a slow box may not have taken the request yet
+    if ((eval { $writer_keep->fileno } // -1) >= 0) {
+        return if AE::now - $t0 < 30 * TIMEOUT_MULT;
+        return $finish->(sprintf 'server still holds the stalled socket after %.0fs',
+                         AE::now - $t0);
+    }
+    undef $poll;
+    $raw->blocking(0);
+    $rw = AE::io($raw, 0, sub {
+        my $n = $raw->sysread(my $buf, 65536);
+        if (defined $n) {
+            $n ? ($got += $n) : ($end = 'EOF');
+            $finish->() if !$n || $got >= 64 * 1024 * 1024;
+        }
+        elsif (!$!{EAGAIN} && !$!{EWOULDBLOCK}) {
+            $end = "error: $!";
+            $finish->();
+        }
+    });
+    $limit = AE::timer(10 * TIMEOUT_MULT, 0, sub { $finish->() });
 });
 
 $cv->recv;

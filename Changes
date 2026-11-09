@@ -1,5 +1,10 @@
 Revision history for Perl extension Feersum
 
+        1.511:
+        - faster HTTP/2, TLS and native paths; less memory on big or idle TLS
+        - timer-made writes are sent when the timer returns; no handle DESTROY
+        - fix: re-listening right after unlisten() could spin the event loop
+
 1.509 Tue Oct 20 14:54:11 2026 +0300
         - security and robustness hardening across HTTP/1, HTTP/2 and TLS
         - enforce retired generation drain deadlines through reload and shutdown
